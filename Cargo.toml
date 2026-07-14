@@ -16,6 +16,8 @@ parking_lot = "0.12"
 # TLS (self-signed cert. generation & runtime provider)
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # Exchange WebSocket adapters
 flowsurface-exchange = "0.8.9"

@@ -192,6 +192,15 @@ impl App {
                 std::process::exit(1);
             });
 
+            tracing::info!(
+                "TLS certificate fingerprint (SHA-256): {}",
+                tls_cert.fingerprint
+            );
+            tracing::info!(
+                "Use this fingerprint for cert pinning: sha256${}",
+                tls_cert.fingerprint
+            );
+
             Some(
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(

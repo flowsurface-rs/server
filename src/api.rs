@@ -163,13 +163,14 @@ impl Server {
         let expected = format!("Bearer {expected_token}");
 
         if provided != expected {
-            // Get a best-effort client IP for the audit log.
             let client_ip = headers
                 .get("X-Forwarded-For")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
+
+            let truncated: String = provided.chars().take(20).collect();
             tracing::warn!(
-                "Auth failure from {client_ip}: expected valid Bearer token, got '{provided}'"
+                "Auth failure from {client_ip}: expected valid Bearer token, got '{truncated}'"
             );
             return Err((StatusCode::UNAUTHORIZED, "missing or invalid auth token"));
         }

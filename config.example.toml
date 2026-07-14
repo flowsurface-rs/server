@@ -12,8 +12,8 @@ data_dir = "./data"
 # flush_interval_ms = 2000
 
 # Data retention period in hours.  Trades older than this will be purged
-# on startup (and periodically while running).  Default: 96 (4 days).
-# data_retention_hours = 96
+# on startup (and periodically while running).  Default: 48 (2 days).
+# data_retention_hours = 48
 
 # Base assets to track — expanded via the whitelist templates below.
 # The server fetches exchange metadata and resolves pairs at startup.
