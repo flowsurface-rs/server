@@ -1,0 +1,8 @@
+/target
+/data
+*.env
+*.toml
+!Cargo.toml
+!config.example.toml
+.DS_Store
+*.log

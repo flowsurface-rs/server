@@ -1,0 +1,43 @@
+# By default it looks for a "config.toml" next to the binary.
+# Use --config <path> to specify a different location.
+
+bind_address = "127.0.0.1:8080"
+# Optional authentication token (required if bind_address is not loopback).
+# auth_token = "changeme"
+
+data_dir = "./data"
+
+# Trade batch-flush interval in milliseconds.
+# Lower values reduce data loss on crash; higher values are more I/O-efficient
+# (fewer fsyncs, larger columnar batches).  Default: 2000 (2 seconds).
+# flush_interval_ms = 2000
+
+# Data retention period in hours.  Trades older than this will be purged
+# on startup (and periodically while running).  Default: 96 (4 days).
+# data_retention_hours = 96
+
+# Base assets to track — expanded via the whitelist templates below.
+# The server fetches exchange metadata and resolves pairs at startup.
+base_assets = ["BTC", "ETH"]
+
+# Whitelist templates: per-venue, per-market-kind suffix patterns(quote assets).
+# To exclude a venue entirely, omit it from the whitelist.
+# To exclude a market kind for a venue, omit that key.
+[whitelist.binance]
+spot = ["USDT"]
+linear = ["USDT", "USDC"]
+inverse = ["USD_PERP"]
+
+[whitelist.bybit]
+spot = ["USDT"]
+linear = ["USDT"]
+
+[whitelist.hyperliquid]
+# Hyperliquid pairs don't carry a suffix, allow all
+# This will resolved as BTC-USDC and ETH-USDC pairs given their API and the `base_assets` above
+linear = [""]
+
+[whitelist.okex]
+spot = ["-USDT"]
+linear = ["-USDT-SWAP"]
+
