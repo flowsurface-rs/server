@@ -3,6 +3,7 @@ mod config;
 mod discovery;
 mod ingestion;
 mod storage;
+mod tls;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,12 @@ use crate::storage::Storage;
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install aws-lc-rs as the default rustls CryptoProvider");
+
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -31,7 +38,45 @@ async fn main() {
 
     let args = Args::parse();
     let config_path = Config::resolve_path(args.config);
-    let config = Config::load_or_write_template(&config_path);
+    let mut config = Config::load_or_write_template(&config_path);
+
+    if config.auth_token.is_none() {
+        let addr: std::net::SocketAddr = match config.bind_address.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                tracing::error!("Invalid bind_address '{}'", config.bind_address);
+                std::process::exit(1);
+            }
+        };
+        if !addr.ip().is_loopback() {
+            let token_dir = std::path::PathBuf::from(&config.data_dir);
+            let token_file = token_dir.join(".auth_token");
+
+            let token = if token_file.exists() {
+                std::fs::read_to_string(&token_file)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+
+            let token = if token.is_empty() {
+                let mut buf = [0u8; 32];
+                getrandom::getrandom(&mut buf).expect("failed to get random bytes");
+                let t: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+                std::fs::create_dir_all(&token_dir).ok();
+                std::fs::write(&token_file, &t).ok();
+                tracing::info!("Auth token generated: {}", token_file.display());
+                tracing::info!("Token: {t}");
+                t
+            } else {
+                token
+            };
+
+            config.auth_token = Some(token);
+        }
+    }
 
     if let Err(e) = config.validate_auth() {
         tracing::error!("{e:#}");
@@ -52,6 +97,7 @@ struct App {
     auth_token: Option<String>,
     flush_interval: std::time::Duration,
     data_retention_hours: u64,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
 }
 
 impl App {
@@ -131,6 +177,37 @@ impl App {
             }
         }
 
+        // Only generate TLS cert for non-loopback addresses.
+        // On localhost plain HTTP is used — no overhead, no cert needed.
+        let addr: std::net::SocketAddr = config
+            .bind_address
+            .parse()
+            .expect("bind_address already validated");
+
+        let tls_config = if addr.ip().is_loopback() {
+            None
+        } else {
+            let tls_cert = tls::load_or_generate(&data_dir).unwrap_or_else(|e| {
+                tracing::error!("Failed to load/generate TLS certificate: {e:#}");
+                std::process::exit(1);
+            });
+
+            Some(
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        axum_server::tls_rustls::RustlsConfig::from_pem(
+                            tls_cert.cert_pem.as_bytes().to_vec(),
+                            tls_cert.key_pem.as_bytes().to_vec(),
+                        ),
+                    )
+                })
+                .unwrap_or_else(|e| {
+                    tracing::error!("Failed to build TLS config: {e:#}");
+                    std::process::exit(1);
+                }),
+            )
+        };
+
         Self {
             storage,
             adapter_handles,
@@ -140,6 +217,7 @@ impl App {
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             data_retention_hours: config.data_retention_hours,
+            tls_config,
         }
     }
 
@@ -181,6 +259,7 @@ impl App {
             self.auth_token,
             configured_pairs,
             available_tickers,
+            self.tls_config,
         ));
         let server_handle = server.serve(&self.bind_address).await;
 

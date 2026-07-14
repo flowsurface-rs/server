@@ -29,6 +29,10 @@ pub struct Config {
     pub data_dir: String,
     /// Optional bearer-token required on all API requests.
     /// Mandatory when `bind_address` is not a loopback address.
+    ///
+    /// The server uses HTTPS with a self-signed certificate (generated
+    /// on first boot), so the token is always encrypted in transit.
+    #[serde(default, skip_serializing)]
     pub auth_token: Option<String>,
 
     // ── Pair tracking ───────────────────────────────────────────
@@ -82,7 +86,16 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))
+        let mut cfg: Self =
+            toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+        if let Ok(token) = std::env::var("AUTH_TOKEN")
+            && !token.is_empty()
+        {
+            cfg.auth_token = Some(token);
+        }
+
+        Ok(cfg)
     }
 
     /// Resolve the whitelist templates, falling back to an empty map.

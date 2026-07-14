@@ -10,6 +10,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use flowsurface_exchange::{TickerInfo, Trade};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,9 @@ pub struct Server {
     /// All available ticker symbols per exchange, from the metadata cache.
     /// Used by `/exchanges` to help users discover correct suffix patterns.
     pub available_tickers: HashMap<String, Vec<String>>,
+    /// TLS configuration for the HTTPS server (self-signed).
+    /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
+    pub tls_config: Option<RustlsConfig>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +136,7 @@ impl Server {
         auth_token: Option<String>,
         configured_pairs: Vec<(String, String)>,
         available_tickers: HashMap<String, Vec<String>>,
+        tls_config: Option<RustlsConfig>,
     ) -> Self {
         Self {
             storage,
@@ -139,6 +144,7 @@ impl Server {
             auth_token,
             configured_pairs,
             available_tickers,
+            tls_config,
         }
     }
 
@@ -157,6 +163,14 @@ impl Server {
         let expected = format!("Bearer {expected_token}");
 
         if provided != expected {
+            // Get a best-effort client IP for the audit log.
+            let client_ip = headers
+                .get("X-Forwarded-For")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            tracing::warn!(
+                "Auth failure from {client_ip}: expected valid Bearer token, got '{provided}'"
+            );
             return Err((StatusCode::UNAUTHORIZED, "missing or invalid auth token"));
         }
 
@@ -324,22 +338,17 @@ impl Server {
         }
     }
 
-    /// Bind to `bind_address` and spawn the axum HTTP server.
-    /// Exits the process on bind failure.
+    /// Bind to `bind_address` and spawn the axum HTTP(S) server.
+    ///
+    /// Uses plain HTTP for loopback addresses, HTTPS with a self-signed
+    /// certificate for non-loopback (remote) binds.  Exits on bind failure.
     pub async fn serve(self: Arc<Self>, bind_address: &str) -> tokio::task::JoinHandle<()> {
         let addr: SocketAddr = bind_address.parse().unwrap_or_else(|e| {
             tracing::error!("Invalid bind_address '{bind_address}': {e}");
             std::process::exit(1);
         });
 
-        tracing::info!("Starting HTTP API on {addr}");
-
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Failed to bind to {addr}: {e}");
-                std::process::exit(1);
-            });
+        let tls_config = self.tls_config.clone();
 
         let router = Router::new()
             .route("/status", get(Server::status))
@@ -354,7 +363,22 @@ impl Server {
             .with_state(self);
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            if let Some(cfg) = tls_config {
+                tracing::info!("Starting HTTPS API on {addr}");
+                axum_server::bind_rustls(addr, cfg)
+                    .serve(router.into_make_service())
+                    .await
+                    .unwrap();
+            } else {
+                tracing::info!("Starting HTTP API on {addr}");
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("Failed to bind to {addr}: {e}");
+                        std::process::exit(1);
+                    });
+                axum::serve(listener, router).await.unwrap();
+            }
         })
     }
 }

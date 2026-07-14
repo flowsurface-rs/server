@@ -7,10 +7,15 @@ license = "MIT"
 [dependencies]
 # HTTP / async runtime / concurrency
 axum = { version = "0.7", default-features = false, features = ["query", "tokio", "http1"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "signal", "net", "time"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 parking_lot = "0.12"
+
+# TLS (self-signed cert. generation & runtime provider)
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 # Exchange WebSocket adapters
 flowsurface-exchange = "0.8.9"
@@ -25,6 +30,10 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 # CLI argument parsing
 clap = { version = "4", default-features = false, features = ["derive", "std"] }
+
+# Environment / config
+dotenvy = { version = "0.15", default-features = false }
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
 
 # Logging
 tracing = { version = "0.1", default-features = false, features = ["std"] }
