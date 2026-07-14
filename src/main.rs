@@ -47,6 +47,7 @@ struct App {
     storage: Storage,
     adapter_handles: AdapterHandles,
     resolved_pairs: Vec<ResolvedPair>,
+    metadata_cache: discovery::MetadataCache,
     bind_address: String,
     auth_token: Option<String>,
     flush_interval: std::time::Duration,
@@ -65,27 +66,41 @@ impl App {
         storage.run_cleanup(config.data_retention_hours);
 
         let whitelist = config.resolve_whitelist();
-        if whitelist.is_empty() || config.base_assets.is_empty() {
+        if !config.discovery_mode && (whitelist.is_empty() || config.base_assets.is_empty()) {
             tracing::error!("No pairs configured. Set base_assets and whitelist in config.toml");
             std::process::exit(1);
         }
 
-        let venues: Vec<Venue> = discovery::venues_from_whitelist(&whitelist);
+        let venues: Vec<Venue> = if config.discovery_mode {
+            Venue::ALL.to_vec()
+        } else {
+            discovery::venues_from_whitelist(&whitelist)
+        };
         tracing::info!("Spawning venue adapters: {venues:?}");
         let adapter_handles = AdapterHandles::spawn_venues(venues, None);
 
         tracing::info!("Fetching ticker metadata from exchanges…");
-        let metadata_cache = discovery::build_metadata_cache(&adapter_handles, &whitelist).await;
+        let metadata_cache =
+            discovery::build_metadata_cache(&adapter_handles, &whitelist, config.discovery_mode)
+                .await;
 
         let resolved_pairs =
             discovery::resolve_pairs(&config.base_assets, &whitelist, &metadata_cache);
 
         if resolved_pairs.is_empty() {
-            tracing::error!(
-                "No matching pairs found for base_assets {:?} with current whitelist",
-                config.base_assets
-            );
-            std::process::exit(1);
+            if config.discovery_mode {
+                tracing::warn!(
+                    "No matching pairs for base_assets {:?} with current whitelist \
+                     — discovery mode is on, so /exchanges is still populated.",
+                    config.base_assets
+                );
+            } else {
+                tracing::error!(
+                    "No matching pairs found for base_assets {:?} with current whitelist",
+                    config.base_assets
+                );
+                std::process::exit(1);
+            }
         }
 
         tracing::info!(
@@ -120,6 +135,7 @@ impl App {
             storage,
             adapter_handles,
             resolved_pairs,
+            metadata_cache,
             bind_address: config.bind_address.clone(),
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
@@ -159,7 +175,13 @@ impl App {
             })
             .collect();
 
-        let server = Arc::new(Server::new(self.storage, self.auth_token, configured_pairs));
+        let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
+        let server = Arc::new(Server::new(
+            self.storage,
+            self.auth_token,
+            configured_pairs,
+            available_tickers,
+        ));
         let server_handle = server.serve(&self.bind_address).await;
 
         AppHandles {

@@ -5,9 +5,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-/// Whitelist templates: venue → market_kind → list of suffixes.
+/// Whitelist templates: venue → market_kind → list of quote assets.
 ///
-/// For example `{"binance": {"spot": ["USDT"], "linear": ["USDT"]}}`.
+/// For example `{"binance": {"spot": ["USDT"], "linear": ["USDT", "USDC"]}}`.
+/// The server constructs the correct ticker string per exchange
+/// (handling separators, _PERP, -SWAP suffixes, etc.).
 pub type WhitelistTemplates = HashMap<String, HashMap<String, Vec<String>>>;
 
 #[derive(Parser)]
@@ -49,6 +51,13 @@ pub struct Config {
     /// deleted on startup (and periodically while running).
     #[serde(default = "default_data_retention_hours")]
     pub data_retention_hours: u64,
+
+    /// When `true`, fetch metadata for **all** supported exchange variants
+    /// on startup so `/exchanges` is fully populated, regardless of the
+    /// whitelist.  Useful for discovering available tickers before deciding
+    /// what to track.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub discovery_mode: bool,
 }
 
 const fn default_flush_interval() -> u64 {
@@ -57,6 +66,10 @@ const fn default_flush_interval() -> u64 {
 
 const fn default_data_retention_hours() -> u64 {
     48
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Config {

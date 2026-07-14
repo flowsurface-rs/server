@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,6 +22,9 @@ pub struct Server {
     /// The set of (exchange, symbol) pairs configured at startup.
     /// Used by `/pairs` to include pairs that have not yet received trades.
     pub configured_pairs: Vec<(String, String)>,
+    /// All available ticker symbols per exchange, from the metadata cache.
+    /// Used by `/exchanges` to help users discover correct suffix patterns.
+    pub available_tickers: HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -117,17 +121,24 @@ pub struct GroupedTradeQuery {
     step: Option<u16>,
 }
 
+#[derive(Serialize)]
+struct ExchangesResponse {
+    exchanges: HashMap<String, Vec<String>>,
+}
+
 impl Server {
     pub fn new(
         storage: Storage,
         auth_token: Option<String>,
         configured_pairs: Vec<(String, String)>,
+        available_tickers: HashMap<String, Vec<String>>,
     ) -> Self {
         Self {
             storage,
             startup: Instant::now(),
             auth_token,
             configured_pairs,
+            available_tickers,
         }
     }
 
@@ -181,6 +192,17 @@ impl Server {
             status: "ok",
             uptime_secs: uptime,
             tracked_pairs: db_count as usize,
+        })
+    }
+
+    /// GET /exchanges
+    ///
+    /// Returns all available ticker symbols per exchange, as discovered from
+    /// the exchange APIs at startup.  Useful for discovering the correct suffix
+    /// patterns when configuring `config.toml`.
+    async fn exchanges(State(state): State<Arc<Self>>) -> impl IntoResponse {
+        Self::json_ok(&ExchangesResponse {
+            exchanges: state.available_tickers.clone(),
         })
     }
 
@@ -321,6 +343,7 @@ impl Server {
 
         let router = Router::new()
             .route("/status", get(Server::status))
+            .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
             .route("/trades/grouped", get(Server::grouped_trades))
