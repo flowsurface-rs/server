@@ -35,12 +35,13 @@ pub struct Server {
 struct StatusResponse {
     status: &'static str,
     uptime_secs: u64,
-    tracked_pairs: usize,
+    db_ok: bool,
 }
 
 #[derive(Serialize)]
 struct PairsResponse {
     pairs: Vec<PairInfo>,
+    tracked_count: usize,
 }
 
 #[derive(Serialize)]
@@ -198,15 +199,18 @@ impl Server {
             .into_response()
     }
 
-    /// GET /status
+    /// GET /status  (public — no auth required)
+    ///
+    /// Returns server uptime and a basic DB connectivity check.
+    /// Suitable for load-balancer / container health probes.
     async fn status(State(state): State<Arc<Self>>) -> impl IntoResponse {
         let uptime = state.startup.elapsed().as_secs();
-        let db_count = state.storage.pair_count().unwrap_or(0);
+        let db_ok = state.storage.pair_count().is_ok();
 
         Self::json_ok(&StatusResponse {
             status: "ok",
             uptime_secs: uptime,
-            tracked_pairs: db_count as usize,
+            db_ok,
         })
     }
 
@@ -255,7 +259,11 @@ impl Server {
             }
         }
 
-        Self::json_ok(&PairsResponse { pairs: merged })
+        let count = merged.len();
+        Self::json_ok(&PairsResponse {
+            pairs: merged,
+            tracked_count: count,
+        })
     }
 
     /// GET /trades
@@ -351,8 +359,13 @@ impl Server {
 
         let tls_config = self.tls_config.clone();
 
-        let router = Router::new()
+        // Public routes — no auth required
+        let public = Router::new()
             .route("/status", get(Server::status))
+            .with_state(self.clone());
+
+        // Protected routes — require Bearer token when auth is configured
+        let protected = Router::new()
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
@@ -362,6 +375,8 @@ impl Server {
                 auth_middleware,
             ))
             .with_state(self);
+
+        let router = public.merge(protected);
 
         tokio::spawn(async move {
             if let Some(cfg) = tls_config {

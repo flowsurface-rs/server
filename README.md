@@ -1,7 +1,7 @@
 # flowsurface-server
 
 A trade data store daemon. Connects to crypto exchange WebSocket
-streams via flowsurface-exchange, persists trades to an embedded DuckDB database, and serves them over
+streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange), persists trades to an embedded DuckDB database, and serves them over
 a REST API.
 
 ## Quick start
@@ -54,9 +54,15 @@ whitelist and reduce startup time.
 ### Authentication (`AUTH_TOKEN`)
 
 When binding to a non-loopback address, the server generates an
-auth token on first boot and logs it to the console.
+auth token on first boot and saves it as `data/.auth_token`.
+The token's first 4 characters are shown at startup; retrieve the
+full token with:
 
-The token is also saved to `data/.auth_token` and reused across restarts.
+```bash
+cat data/.auth_token
+```
+
+The token is reused across restarts.
 
 You can also set a specific token manually via env var:
 
@@ -104,16 +110,17 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 
 ## API endpoints
 
-All endpoints require `Authorization: Bearer <token>` when auth is
-configured.
+`/status` is **public** (no auth) — suitable for health checks.
+All other endpoints require `Authorization: Bearer <token>` when
+auth is configured.
 
-| Method | Path              | Description                                        |
-| ------ | ----------------- | -------------------------------------------------- |
-| GET    | `/status`         | Server uptime & pairs with stored trades           |
-| GET    | `/exchanges`      | Available ticker symbols per exchange              |
-| GET    | `/pairs`          | Configured pairs with time bounds                  |
-| GET    | `/trades`         | Trade data (filtered by venue, symbol, time range) |
-| GET    | `/trades/grouped` | Aggregated trades (tick-aligned price buckets)     |
+| Method | Path              | Auth     | Description                                        |
+| ------ | ----------------- | -------- | -------------------------------------------------- |
+| GET    | `/status`         | ✗ public | Server uptime, DB connectivity check               |
+| GET    | `/exchanges`      | required | Available ticker symbols per exchange              |
+| GET    | `/pairs`          | required | Configured pairs with time bounds & tracked count  |
+| GET    | `/trades`         | required | Trade data (filtered by venue, symbol, time range) |
+| GET    | `/trades/grouped` | required | Aggregated trades (tick-aligned price buckets)     |
 
 ### Query parameters for `/trades`
 
@@ -147,7 +154,7 @@ Exchange WS ─▶ flowsurface-server ─▶ DuckDB
               REST API (HTTP/HTTPS)
                     │
                     ▼
-              Client app (StoreClient)
+                  Client
 ```
 
 - `flowsurface-exchange` adapters connect to exchange WebSocket streams
