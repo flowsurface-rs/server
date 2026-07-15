@@ -187,10 +187,13 @@ impl App {
         let tls_config = if addr.ip().is_loopback() {
             None
         } else {
-            let tls_cert = tls::load_or_generate(&data_dir).unwrap_or_else(|e| {
-                tracing::error!("Failed to load/generate TLS certificate: {e:#}");
-                std::process::exit(1);
-            });
+            let tls_domain = config.tls_domain.clone();
+            let bind_ip = (!addr.ip().is_unspecified()).then_some(addr.ip());
+            let tls_cert =
+                tls::load_or_generate(&data_dir, &tls_domain, bind_ip).unwrap_or_else(|e| {
+                    tracing::error!("Failed to load/generate TLS certificate: {e:#}");
+                    std::process::exit(1);
+                });
 
             tracing::info!(
                 "TLS certificate fingerprint (SHA-256): {}",

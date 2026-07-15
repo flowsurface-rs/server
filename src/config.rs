@@ -62,6 +62,14 @@ pub struct Config {
     /// what to track.  Default: `true`.
     #[serde(default = "default_true")]
     pub discovery_mode: bool,
+
+    /// Domain name inserted into the self-signed TLS certificate's SAN
+    /// (Subject Alternative Names).
+    ///
+    /// Ignored when `bind_address` is a loopback address (plain HTTP).
+    /// Default: `"flowsurface-server"`.
+    #[serde(default = "default_tls_domain")]
+    pub tls_domain: String,
 }
 
 const fn default_flush_interval() -> u64 {
@@ -74,6 +82,10 @@ const fn default_data_retention_hours() -> u64 {
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_tls_domain() -> String {
+    "flowsurface-server".to_string()
 }
 
 impl Config {

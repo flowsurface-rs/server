@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
 use sha2::{Digest, Sha256};
 
 /// A self-signed certificate and its private key, both in PEM format,
@@ -62,7 +62,16 @@ fn restrict_permissions(path: &Path) {
 
 /// Load a self-signed cert from `data_dir/cert.pem` + `data_dir/key.pem`,
 /// or generate and persist them if they don't exist.
-pub fn load_or_generate(data_dir: &Path) -> Result<SelfSignedCert> {
+///
+/// `domain` is inserted as a DNS SAN (Subject Alternative Name) so that
+/// clients connecting via that DNS name do not get a hostname-verification
+/// error.  `bind_ip`, when provided, is also added as an IP SAN so that
+/// direct IP connections pass hostname checks as well.
+pub fn load_or_generate(
+    data_dir: &Path,
+    domain: &str,
+    bind_ip: Option<std::net::IpAddr>,
+) -> Result<SelfSignedCert> {
     let cert_path = data_dir.join("cert.pem");
     let key_path = data_dir.join("key.pem");
 
@@ -86,12 +95,17 @@ pub fn load_or_generate(data_dir: &Path) -> Result<SelfSignedCert> {
     tracing::info!("Generating self-signed TLS certificate…");
 
     let key_pair = KeyPair::generate().context("generating ECDSA P-256 key pair")?;
-    let mut params = CertificateParams::new(vec!["flowsurface-server".to_string()])
+    let mut params = CertificateParams::new(vec![domain.to_string()])
         .context("creating certificate parameters")?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "flowsurface-server");
+        .push(rcgen::DnType::CommonName, domain);
+
+    // If binding to a specific (non-wildcard) IP, include it as an IP SAN.
+    if let Some(ip) = bind_ip {
+        params.subject_alt_names.push(SanType::IpAddress(ip));
+    }
 
     let cert = params
         .self_signed(&key_pair)

@@ -79,6 +79,21 @@ when binding to a non-loopback address (e.g. `0.0.0.0:8080`).
 3. (Optional) The server logs the certificate's SHA-256 fingerprint at startup.
 4. Clients can now use `https://vps-ip:8080` with the generated auth token.
 
+#### Connecting via a domain name
+
+By default the self-signed cert only identifies itself as
+`flowsurface-server`. If you point a domain at your VPS and want
+clients to actually _verify_ the certificate (e.g. with `--cacert`
+instead of `-k`), set `tls_domain` so the cert matches:
+
+```toml
+tls_domain = "data.mydomain.com"
+```
+
+Then connect via `https://data.mydomain.com:8080` — raw-IP
+connections are not supported for verified TLS. The cert's SHA-256
+fingerprint is still logged at startup for pinning.
+
 ### Local development
 
 For local-only use, keep `bind_address = "127.0.0.1:8080"`:
