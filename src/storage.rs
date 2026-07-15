@@ -174,7 +174,7 @@ impl Storage {
             sql.push_str(" AND ts <= ?");
         }
 
-        sql.push_str(" ORDER BY ts DESC");
+        sql.push_str(" ORDER BY ts ASC");
         sql.push_str(&format!(" LIMIT {}", limit));
 
         let mut stmt = conn.prepare(&sql).context("preparing trade query")?;
