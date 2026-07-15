@@ -126,24 +126,96 @@ auth is configured.
 
 | Param    | Type   | Description                                  |
 | -------- | ------ | -------------------------------------------- |
-| `venue`  | string | Exchange name (e.g. `binance`)               |
-| `market` | string | `spot`, `linear`, or `inverse`               |
+| `venue`  | string | **Required.** Exchange name (e.g. `binance`) |
+| `market` | string | **Required.** `spot`, `linear`, or `inverse` |
 | `symbol` | string | **Required.** Ticker symbol (e.g. `btcusdt`) |
-| `from`   | int    | Unix ms lower bound                          |
-| `to`     | int    | Unix ms upper bound                          |
+| `from`   | int    | Unix ms lower bound (inclusive)              |
+| `to`     | int    | Unix ms upper bound (inclusive)              |
 | `limit`  | int    | Max records (default 1000, max 10 000)       |
+
+#### Response fields
+
+| Field      | Type   | Description                                         |
+| ---------- | ------ | --------------------------------------------------- |
+| `trades`   | array  | Array of matching trades                            |
+| `exchange` | string | Canonical exchange identifier (e.g. `Binance Spot`) |
+| `symbol`   | string | Ticker in lowercase (e.g. `btcusdt`)                |
+| `ts`       | int    | Unix millisecond timestamp                          |
+| `price`    | float  | Trade price                                         |
+| `qty`      | float  | Trade quantity                                      |
+| `is_sell`  | bool   | `true` if a sell, `false` if a buy                  |
+
+#### Response example
+
+`GET /trades?venue=bybit&market=linear&symbol=btcusdt&from=1784108317135&limit=2`
+
+```json
+{
+    "trades": [
+        {
+            "exchange": "Bybit Linear",
+            "symbol": "btcusdt",
+            "ts": 1784108317317,
+            "price": 64774.8,
+            "qty": 0.111,
+            "is_sell": false
+        },
+        {
+            "exchange": "Bybit Linear",
+            "symbol": "btcusdt",
+            "ts": 1784108317964,
+            "price": 64774.7,
+            "qty": 0.003,
+            "is_sell": true
+        }
+    ]
+}
+```
 
 ### Query parameters for `/trades/grouped`
 
 | Param    | Type   | Description                                                             |
 | -------- | ------ | ----------------------------------------------------------------------- |
-| `venue`  | string | Exchange name (e.g. `binance`)                                          |
-| `market` | string | `spot`, `linear`, or `inverse`                                          |
+| `venue`  | string | **Required.** Exchange name (e.g. `binance`)                            |
+| `market` | string | **Required.** `spot`, `linear`, or `inverse`                            |
 | `symbol` | string | **Required.** Ticker symbol (e.g. `btcusdt`)                            |
-| `from`   | int    | Unix ms lower bound                                                     |
-| `to`     | int    | Unix ms upper bound                                                     |
+| `from`   | int    | Unix ms lower bound (inclusive)                                         |
+| `to`     | int    | Unix ms upper bound (inclusive)                                         |
 | `limit`  | int    | Max records (default 1000, max 10 000)                                  |
 | `step`   | int    | Price bucket width multiplier (default 1). Bucket = min_ticksize × step |
+
+#### Response fields
+
+| Field         | Type  | Description                                  |
+| ------------- | ----- | -------------------------------------------- |
+| `trades`      | array | Array of aggregated price buckets            |
+| `price_level` | float | Tick-aligned price bucket label              |
+| `buy_volume`  | float | Total buy quantity in this bucket            |
+| `sell_volume` | float | Total sell quantity in this bucket           |
+| `buy_count`   | int   | Number of buy trades in this bucket          |
+| `sell_count`  | int   | Number of sell trades in this bucket         |
+| `first_ts`    | int   | Earliest trade timestamp in bucket (Unix ms) |
+| `last_ts`     | int   | Latest trade timestamp in bucket (Unix ms)   |
+
+#### Response example
+
+`GET /trades/grouped?venue=binance&market=linear&symbol=btcusdt&step=100&limit=1`
+
+```json
+{
+    "trades": [
+        {
+            "price_level": 64780.0,
+            "buy_volume": 1104.205,
+            "sell_volume": 1082.517,
+            "buy_count": 9183,
+            "sell_count": 8842,
+            "first_ts": 1784043116723,
+            "last_ts": 1784107852242
+        }
+    ]
+}
+```
 
 ## Architecture
 

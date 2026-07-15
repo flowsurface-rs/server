@@ -93,11 +93,11 @@ impl Serialize for AnnotatedTrade {
 #[derive(Debug, Deserialize)]
 pub struct TradeQuery {
     /// Venue filter, e.g. "binance" (used with `market` to derive exchange).
-    pub venue: Option<String>,
+    pub venue: String,
     /// Symbol filter.
     pub symbol: String,
-    /// Optional market filter: "spot", "linear", or "inverse" (used with `venue`).
-    pub market: Option<String>,
+    /// Market filter: "spot", "linear", or "inverse" (used with `venue`).
+    pub market: String,
     /// Inclusive lower bound (milliseconds since epoch). Optional.
     pub from: Option<i64>,
     /// Inclusive upper bound (milliseconds since epoch). Optional.
@@ -110,11 +110,11 @@ pub struct TradeQuery {
 #[derive(Debug, Deserialize)]
 pub struct GroupedTradeQuery {
     /// Venue filter, e.g. "binance" (used with `market` to derive exchange).
-    venue: Option<String>,
+    venue: String,
     /// Symbol filter.
     symbol: String,
-    /// Optional market filter: "spot", "linear", or "inverse" (used with `venue`).
-    market: Option<String>,
+    /// Market filter: "spot", "linear", or "inverse" (used with `venue`).
+    market: String,
     /// Inclusive lower bound (milliseconds since epoch). Optional.
     from: Option<i64>,
     /// Inclusive upper bound (milliseconds since epoch). Optional.
@@ -280,10 +280,7 @@ impl Server {
         query: Query<GroupedTradeQuery>,
     ) -> impl IntoResponse {
         // Derive the canonical exchange string from venue + market.
-        let ex_str = match Storage::exchange_from_venue_market(
-            query.venue.as_deref().unwrap_or(""),
-            query.market.as_deref(),
-        ) {
+        let ex_str = match Storage::exchange_from_venue_market(&query.venue, &query.market) {
             Some(ex) => ex,
             None => {
                 return Self::json_err(

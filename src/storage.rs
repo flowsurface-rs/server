@@ -137,17 +137,17 @@ impl Storage {
     // ── queries ──────────────────────────────────────────────────────
 
     /// Derive the canonical exchange string from raw `venue` + `market` strings.
-    pub fn exchange_from_venue_market(venue: &str, market: Option<&str>) -> Option<String> {
+    pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
         let venue_enum: flowsurface_exchange::adapter::Venue = venue.parse().ok()?;
-        let market_enum: flowsurface_exchange::adapter::MarketKind =
-            market.unwrap_or("spot").parse().ok()?;
+        let market_enum: flowsurface_exchange::adapter::MarketKind = market.parse().ok()?;
         flowsurface_exchange::adapter::Exchange::from_venue_and_market(venue_enum, market_enum)
             .map(|ex| ex.to_string())
     }
 
     /// Derive an exchange filter string from a `TradeQuery`'s `venue` + `market`.
-    fn exchange_filter(q: &TradeQuery) -> Option<String> {
-        Self::exchange_from_venue_market(q.venue.as_ref()?, q.market.as_deref())
+    fn exchange_filter(q: &TradeQuery) -> String {
+        Self::exchange_from_venue_market(&q.venue, &q.market)
+            .unwrap_or_else(|| format!("{}/{}", q.venue, q.market))
     }
 
     /// Query trades matching the given filter.
@@ -161,12 +161,10 @@ impl Storage {
         let mut sql = String::from(
             "SELECT exchange, symbol, ts, price, qty, is_sell
              FROM trades
-             WHERE symbol = ?",
+             WHERE symbol = ?
+             AND exchange = ?",
         );
 
-        if exchange.is_some() {
-            sql.push_str(" AND exchange = ?");
-        }
         if q.from.is_some() {
             sql.push_str(" AND ts >= ?");
         }
@@ -180,10 +178,10 @@ impl Storage {
         let mut stmt = conn.prepare(&sql).context("preparing trade query")?;
 
         // Collect parameters in order.
-        let mut params: Vec<&dyn duckdb::ToSql> = vec![&q.symbol as &dyn duckdb::ToSql];
-        if let Some(ref ex) = exchange {
-            params.push(ex as &dyn duckdb::ToSql);
-        }
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![
+            &q.symbol as &dyn duckdb::ToSql,
+            &exchange as &dyn duckdb::ToSql,
+        ];
         if let Some(ref from) = q.from {
             params.push(from as &dyn duckdb::ToSql);
         }
@@ -317,12 +315,10 @@ impl Storage {
                 MIN(ts)                        AS first_ts,
                 MAX(ts)                        AS last_ts
              FROM trades
-             WHERE symbol = ?",
+             WHERE symbol = ?
+             AND exchange = ?",
         );
 
-        if exchange.is_some() {
-            sql.push_str(" AND exchange = ?");
-        }
         if q.from.is_some() {
             sql.push_str(" AND ts >= ?");
         }
@@ -347,10 +343,8 @@ impl Storage {
             &qty_prec as &dyn duckdb::ToSql,
             &qty_prec as &dyn duckdb::ToSql,
             &q.symbol as &dyn duckdb::ToSql,
+            &exchange as &dyn duckdb::ToSql,
         ];
-        if let Some(ref ex) = exchange {
-            params.push(ex);
-        }
         if let Some(ref from) = q.from {
             params.push(from);
         }
