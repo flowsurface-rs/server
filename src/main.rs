@@ -198,11 +198,31 @@ impl App {
         } else {
             let tls_domain = config.tls_domain.clone();
             let bind_ip = (!addr.ip().is_unspecified()).then_some(addr.ip());
+
+            let cert_path = data_dir.join("cert.pem");
+            let key_path = data_dir.join("key.pem");
+            if cert_path.exists() && key_path.exists() {
+                let stored_domain = storage.get_metadata("tls_domain").ok().flatten();
+                if stored_domain.as_deref() != Some(tls_domain.as_str()) {
+                    tracing::warn!(
+                        "tls_domain changed ({:?} → {:?}), regenerating TLS certificate",
+                        stored_domain,
+                        tls_domain,
+                    );
+                    std::fs::remove_file(&cert_path).ok();
+                    std::fs::remove_file(&key_path).ok();
+                }
+            }
+
             let tls_cert =
                 tls::load_or_generate(&data_dir, &tls_domain, bind_ip).unwrap_or_else(|e| {
                     tracing::error!("Failed to load/generate TLS certificate: {e:#}");
                     std::process::exit(1);
                 });
+
+            if let Err(e) = storage.set_metadata("tls_domain", &tls_domain) {
+                tracing::warn!("Failed to persist tls_domain metadata: {e:#}");
+            }
 
             tracing::info!(
                 "TLS certificate fingerprint (SHA-256): {}",
