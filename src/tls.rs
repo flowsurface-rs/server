@@ -49,7 +49,7 @@ fn fingerprint_from_pem(pem: &str) -> Option<String> {
 
 /// Set Unix permissions to 0o600 (owner read/write only) on `path`.
 /// Silently ignored on non-Unix platforms.
-fn restrict_permissions(path: &Path) {
+pub(crate) fn restrict_permissions(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

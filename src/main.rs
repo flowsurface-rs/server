@@ -64,11 +64,20 @@ async fn main() {
             let token = if token.is_empty() {
                 let mut buf = [0u8; 32];
                 getrandom::getrandom(&mut buf).expect("failed to get random bytes");
+
                 let t: String = buf.iter().map(|b| format!("{b:02x}")).collect();
                 std::fs::create_dir_all(&token_dir).ok();
                 std::fs::write(&token_file, &t).ok();
-                tracing::info!("Auth token generated: {}", token_file.display());
-                tracing::info!("Token: {t}");
+
+                tls::restrict_permissions(&token_file);
+
+                tracing::info!(
+                    "Auth token generated → {}\n  \
+                     Token starts with: {}…  (run  cat {}  to view full token)",
+                    token_file.display(),
+                    &t[..4.min(t.len())],
+                    token_file.display(),
+                );
                 t
             } else {
                 token
