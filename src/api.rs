@@ -163,7 +163,7 @@ impl Server {
 
         let expected = format!("Bearer {expected_token}");
 
-        if provided != expected {
+        if !provided.eq_ignore_ascii_case(&expected) {
             let client_ip = headers
                 .get("X-Forwarded-For")
                 .and_then(|v| v.to_str().ok())
@@ -397,12 +397,15 @@ impl Server {
 }
 
 /// Thin axum middleware that delegates auth checking to `Server::check_auth`.
+/// Returns a JSON error body on auth failure for consistency with the rest of the API.
 async fn auth_middleware(
     State(state): State<Arc<Server>>,
     headers: HeaderMap,
     req: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<axum::response::Response, (StatusCode, &'static str)> {
-    state.check_auth(&headers)?;
-    Ok(next.run(req).await)
+) -> axum::response::Response {
+    if let Err((status, msg)) = state.check_auth(&headers) {
+        return Server::json_err(status, msg);
+    }
+    next.run(req).await
 }

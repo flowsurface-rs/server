@@ -40,54 +40,7 @@ async fn main() {
     let config_path = Config::resolve_path(args.config);
     let mut config = Config::load_or_write_template(&config_path);
 
-    if config.auth_token.is_none() {
-        let addr: std::net::SocketAddr = match config.bind_address.parse() {
-            Ok(a) => a,
-            Err(_) => {
-                tracing::error!("Invalid bind_address '{}'", config.bind_address);
-                std::process::exit(1);
-            }
-        };
-        if !addr.ip().is_loopback() {
-            let token_dir = std::path::PathBuf::from(&config.data_dir);
-            let token_file = token_dir.join(".auth_token");
-
-            let token = if token_file.exists() {
-                std::fs::read_to_string(&token_file)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string()
-            } else {
-                String::new()
-            };
-
-            let token = if token.is_empty() {
-                let mut buf = [0u8; 32];
-                getrandom::getrandom(&mut buf).expect("failed to get random bytes");
-
-                let t: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-                std::fs::create_dir_all(&token_dir).ok();
-                std::fs::write(&token_file, &t).ok();
-
-                tls::restrict_permissions(&token_file);
-
-                tracing::info!(
-                    "Auth token generated → {}\n  \
-                     Token starts with: {}…  (run  cat {}  to view full token)",
-                    token_file.display(),
-                    &t[..4.min(t.len())],
-                    token_file.display(),
-                );
-                t
-            } else {
-                token
-            };
-
-            config.auth_token = Some(token);
-        }
-    }
-
-    if let Err(e) = config.validate_auth() {
+    if let Err(e) = config.resolve_auth_token() {
         tracing::error!("{e:#}");
         std::process::exit(1);
     }

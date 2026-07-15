@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Whitelist templates: venue → market_kind → list of quote assets.
@@ -131,6 +130,46 @@ impl Config {
         PathBuf::from("config.toml")
     }
 
+    pub fn resolve_auth_token(&mut self) -> anyhow::Result<()> {
+        let addr: std::net::SocketAddr = self
+            .bind_address
+            .parse()
+            .with_context(|| format!("invalid bind_address '{}'", self.bind_address))?;
+
+        if addr.ip().is_loopback() {
+            return Ok(());
+        }
+
+        let token_file = std::path::PathBuf::from(&self.data_dir).join(".auth_token");
+        let on_disk = std::fs::read_to_string(&token_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let token = match (self.auth_token.clone(), on_disk.clone()) {
+            (Some(explicit), _) => explicit,    // env/config wins
+            (None, Some(existing)) => existing, // reuse what's on disk
+            (None, None) => generate_token(),   // nothing anywhere — mint one
+        };
+
+        if on_disk.as_deref() != Some(token.as_str()) {
+            std::fs::create_dir_all(&self.data_dir)
+                .with_context(|| format!("creating data dir '{}'", self.data_dir))?;
+            std::fs::write(&token_file, &token)
+                .with_context(|| format!("writing {}", token_file.display()))?;
+            crate::tls::restrict_permissions(&token_file);
+            tracing::info!(
+                "Auth token → {}\n  Token starts with: {}…  (run `cat {}` to view full token)",
+                token_file.display(),
+                &token[..4.min(token.len())],
+                token_file.display(),
+            );
+        }
+
+        self.auth_token = Some(token);
+        Ok(())
+    }
+
     /// Attempt to load config.
     ///
     /// - If the file is **missing**, writes the default template to disk and
@@ -168,21 +207,11 @@ impl Config {
             }
         }
     }
+}
 
-    /// Validate that auth_token is set when bind_address is not a loopback
-    /// address.
-    pub fn validate_auth(&self) -> Result<()> {
-        let addr: SocketAddr = self
-            .bind_address
-            .parse()
-            .with_context(|| format!("invalid bind_address '{}'", self.bind_address))?;
-        if !addr.ip().is_loopback() && self.auth_token.is_none() {
-            anyhow::bail!(
-                "auth_token is required when bind_address is not a loopback address \
-                 (binding to {})",
-                addr.ip()
-            );
-        }
-        Ok(())
-    }
+/// Generate a random 256-bit hex token.
+fn generate_token() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).expect("failed to get random bytes");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
