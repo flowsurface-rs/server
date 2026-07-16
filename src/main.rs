@@ -219,9 +219,9 @@ impl App {
         let (trade_tx, trade_rx) = mpsc::channel::<api::AnnotatedTrade>(1024);
         let shutdown = CancellationToken::new();
 
-        let flusher =
-            self.storage
-                .spawn_batch_flusher(trade_rx, shutdown.child_token(), self.flush_interval);
+        let flusher = self
+            .storage
+            .spawn_batch_flusher(trade_rx, self.flush_interval);
 
         let _cleanup = self
             .storage

@@ -554,7 +554,6 @@ impl Storage {
     pub fn spawn_batch_flusher(
         &self,
         mut rx: mpsc::Receiver<AnnotatedTrade>,
-        shutdown: CancellationToken,
         flush_interval: Duration,
     ) -> JoinHandle<()> {
         let storage = self.clone();
@@ -575,13 +574,6 @@ impl Storage {
             loop {
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => {
-                        if !buffer.is_empty() && let Err(e) = writer.flush(&buffer) {
-                            tracing::error!("Final flush failed: {e:#}");
-                        }
-                        tracing::info!("Batch flusher shut down.");
-                        break;
-                    }
                     maybe = rx.recv() => {
                         match maybe {
                             Some(trade) => buffer.push(trade),
@@ -596,10 +588,17 @@ impl Storage {
                     }
                     _ = interval.tick() => {
                         if !buffer.is_empty() {
-                            if let Err(e) = writer.flush(&buffer) {
-                                tracing::error!("Batch flush failed: {e:#}");
+                            match writer.flush(&buffer) {
+                                Ok(()) => {
+                                    buffer.clear();
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Batch flush failed ({} buffered trades kept for retry): {e:#}",
+                                        buffer.len()
+                                    );
+                                }
                             }
-                            buffer.clear();
                         }
                     }
                 }
