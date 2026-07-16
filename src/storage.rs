@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flowsurface_exchange::adapter::Exchange;
 use flowsurface_exchange::unit::{ContractSize, MinQtySize, MinTicksize, price::Price, qty::Qty};
 use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
@@ -149,7 +150,8 @@ impl Storage {
 
         let mut stmt = conn.prepare(&sql).context("preparing trade query")?;
 
-        let mut params: Vec<&dyn duckdb::ToSql> = vec![&q.symbol, &exchange];
+        let symbol_lower = q.symbol.to_lowercase();
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![&symbol_lower, &exchange];
         if let Some(ref from) = q.from {
             params.push(from);
         }
@@ -157,22 +159,25 @@ impl Storage {
             params.push(to);
         }
 
-        let rows = stmt.query_map(&params[..], |row| {
-            Ok(AnnotatedTrade {
-                exchange: row.get(0)?,
-                symbol: row.get(1)?,
+        let mut rows = stmt.query(&params[..]).context("querying trades")?;
+
+        let mut trades = Vec::new();
+        while let Some(row) = rows.next()? {
+            let exchange_str: String = row.get(0)?;
+            let symbol_str: String = row.get(1)?;
+            let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
+                anyhow::anyhow!("cannot parse exchange '{exchange_str}': {e}")
+            })?;
+
+            trades.push(AnnotatedTrade {
+                ticker: Ticker::new(&symbol_str, exchange),
                 trade: flowsurface_exchange::Trade {
                     time: UnixMs::new(row.get::<_, i64>(2)? as u64),
                     is_sell: row.get(5)?,
                     price: Price::from_f64(row.get::<_, f64>(3)?),
                     qty: Qty::from_f64(row.get::<_, f64>(4)?),
                 },
-            })
-        })?;
-
-        let mut trades = Vec::new();
-        for row in rows {
-            trades.push(row?);
+            });
         }
         Ok(trades)
     }
@@ -193,7 +198,10 @@ impl Storage {
         for info in infos {
             stmt.execute(duckdb::params![
                 info.exchange().to_string(),
-                info.ticker.to_string().to_lowercase(),
+                info.ticker
+                    .display_symbol()
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_else(|| info.ticker.to_string().to_lowercase()),
                 info.min_ticksize.power,
                 info.min_qty.power,
                 info.contract_size.map(|cs| cs.power),
@@ -221,8 +229,9 @@ impl Storage {
             )
             .context("preparing ticker_info lookup")?;
 
+        let symbol_lower = symbol.to_lowercase();
         let mut rows = stmt
-            .query(duckdb::params![exchange, symbol])
+            .query(duckdb::params![exchange, symbol_lower])
             .context("querying ticker_info")?;
 
         match rows.next().context("iterating ticker_info rows")? {
@@ -233,10 +242,9 @@ impl Storage {
                 let min_qty_power: i8 = row.get(3)?;
                 let contract_size_power: Option<i8> = row.get(4)?;
 
-                let exchange: flowsurface_exchange::adapter::Exchange =
-                    exchange_str.parse().map_err(|e: String| {
-                        anyhow::anyhow!("cannot parse exchange '{exchange_str}': {e}")
-                    })?;
+                let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
+                    anyhow::anyhow!("cannot parse exchange '{exchange_str}': {e}")
+                })?;
 
                 Ok(Some(TickerInfo {
                     ticker: Ticker::new(&symbol_str, exchange),
@@ -308,13 +316,14 @@ impl Storage {
         let step = step_size;
         let price_prec = price_precision as i32;
         let qty_prec = qty_precision as i32;
+        let symbol_lower = q.symbol.to_lowercase();
         let mut params: Vec<&dyn duckdb::ToSql> = vec![
             &step,
             &step,
             &price_prec,
             &qty_prec,
             &qty_prec,
-            &q.symbol,
+            &symbol_lower,
             &exchange,
         ];
         if let Some(ref from) = q.from {
@@ -652,8 +661,11 @@ impl BatchWriter {
         for t in trades {
             appender
                 .append_row((
-                    &t.exchange,
-                    &t.symbol,
+                    &t.ticker.exchange.to_string(),
+                    &t.ticker
+                        .display_symbol()
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_else(|| t.ticker.to_string().to_lowercase()),
                     t.trade.time.as_u64() as i64,
                     t.trade.price.to_f64(),
                     t.trade.qty.to_f64(),

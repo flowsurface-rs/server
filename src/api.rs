@@ -12,27 +12,12 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use flowsurface_exchange::{
-    TickerInfo, Trade,
+    Ticker, Trade,
     adapter::{Exchange, MarketKind, Venue},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{GroupedTrade, PairInfo, Storage};
-
-pub struct Server {
-    pub storage: Storage,
-    pub startup: Instant,
-    pub auth_token: Option<String>,
-    /// The set of (exchange, symbol) pairs configured at startup.
-    /// Used by `/pairs` to include pairs that have not yet received trades.
-    pub configured_pairs: Vec<(String, String)>,
-    /// All available ticker symbols per exchange, from the metadata cache.
-    /// Used by `/exchanges` to help users discover correct suffix patterns.
-    pub available_tickers: HashMap<String, Vec<String>>,
-    /// TLS configuration for the HTTPS server (self-signed).
-    /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
-    pub tls_config: Option<RustlsConfig>,
-}
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -60,30 +45,20 @@ enum Response {
 /// A normalized trade record, used both in-memory and serialized to JSON.
 #[derive(Debug, Clone)]
 pub struct AnnotatedTrade {
-    pub exchange: String,
-    pub symbol: String,
+    pub ticker: Ticker,
     pub trade: Trade,
 }
 
 impl AnnotatedTrade {
-    pub fn new(ticker_info: TickerInfo, trade: Trade) -> Self {
-        let symbol = ticker_info.ticker.to_string().to_lowercase();
-        let exchange = ticker_info.exchange();
-
-        AnnotatedTrade {
-            exchange: exchange.to_string(),
-            symbol: symbol.clone(),
-            trade,
-        }
+    pub fn new(ticker: Ticker, trade: Trade) -> Self {
+        AnnotatedTrade { ticker, trade }
     }
 }
 
 impl Serialize for AnnotatedTrade {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Trade", 6)?;
-        s.serialize_field("exchange", &self.exchange)?;
-        s.serialize_field("symbol", &self.symbol)?;
+        let mut s = serializer.serialize_struct("Trade", 4)?;
         s.serialize_field("ts", &self.trade.time)?;
         s.serialize_field("price", &self.trade.price.to_f64())?;
         s.serialize_field("qty", &self.trade.qty.to_f64())?;
@@ -143,6 +118,21 @@ pub struct GroupedTradeQuery {
     /// Integer multiplier applied to the exchange's minimum tick size
     /// to produce the price bucket width (default 1).
     step: Option<u16>,
+}
+
+pub struct Server {
+    pub storage: Storage,
+    pub startup: Instant,
+    pub auth_token: Option<String>,
+    /// The set of (exchange, symbol) pairs configured at startup.
+    /// Used by `/pairs` to include pairs that have not yet received trades.
+    pub configured_pairs: Vec<(String, String)>,
+    /// All available ticker symbols per exchange, from the metadata cache.
+    /// Used by `/exchanges` to help users discover correct suffix patterns.
+    pub available_tickers: HashMap<String, Vec<String>>,
+    /// TLS configuration for the HTTPS server (self-signed).
+    /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
+    pub tls_config: Option<RustlsConfig>,
 }
 
 impl Server {

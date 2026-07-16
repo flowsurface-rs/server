@@ -11,6 +11,8 @@ pub type MetadataCache = HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>;
 ///
 /// Uses the display symbol when available (e.g. `"PURR/USDC"` instead of
 /// Hyperliquid's opaque internal ID `"@107"`).
+///
+/// Returns symbols in UPPERCASE for consistent display in the `/exchanges` API.
 pub fn tickers_per_exchange(cache: &MetadataCache) -> HashMap<String, Vec<String>> {
     cache
         .iter()
@@ -21,6 +23,7 @@ pub fn tickers_per_exchange(cache: &MetadataCache) -> HashMap<String, Vec<String
                     t.display_symbol()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| t.to_string())
+                        .to_uppercase()
                 })
                 .collect();
             symbols.sort();

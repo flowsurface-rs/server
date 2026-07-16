@@ -232,7 +232,10 @@ impl App {
             .map(|ti| {
                 (
                     ti.exchange().to_string(),
-                    ti.ticker.to_string().to_lowercase(),
+                    ti.ticker
+                        .display_symbol()
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_else(|| ti.ticker.to_string().to_lowercase()),
                 )
             })
             .collect();

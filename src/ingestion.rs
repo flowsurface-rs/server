@@ -80,7 +80,7 @@ async fn run_exchange_ingestion(
                                 let ticker_info = stream_kind.ticker_info();
 
                                 for ft_trade in trades.iter() {
-                                    let normalized = AnnotatedTrade::new(ticker_info, *ft_trade);
+                                    let normalized = AnnotatedTrade::new(ticker_info.ticker, *ft_trade);
 
                                     if tx.send(normalized).is_err() {
                                         tracing::info!(%exchange, "Trade channel closed, stopping ingest");
