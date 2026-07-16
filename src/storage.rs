@@ -177,19 +177,15 @@ impl Storage {
 
         let mut stmt = conn.prepare(&sql).context("preparing trade query")?;
 
-        // Collect parameters in order.
-        let mut params: Vec<&dyn duckdb::ToSql> = vec![
-            &q.symbol as &dyn duckdb::ToSql,
-            &exchange as &dyn duckdb::ToSql,
-        ];
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![&q.symbol, &exchange];
         if let Some(ref from) = q.from {
-            params.push(from as &dyn duckdb::ToSql);
+            params.push(from);
         }
         if let Some(ref to) = q.to {
-            params.push(to as &dyn duckdb::ToSql);
+            params.push(to);
         }
 
-        let rows = stmt.query_map(&params[..] as &[&dyn duckdb::ToSql], |row| {
+        let rows = stmt.query_map(&params[..], |row| {
             Ok(AnnotatedTrade {
                 exchange: row.get(0)?,
                 symbol: row.get(1)?,
@@ -337,13 +333,13 @@ impl Storage {
         let price_prec = price_precision as i32;
         let qty_prec = qty_precision as i32;
         let mut params: Vec<&dyn duckdb::ToSql> = vec![
-            &step as &dyn duckdb::ToSql,
-            &step as &dyn duckdb::ToSql,
-            &price_prec as &dyn duckdb::ToSql,
-            &qty_prec as &dyn duckdb::ToSql,
-            &qty_prec as &dyn duckdb::ToSql,
-            &q.symbol as &dyn duckdb::ToSql,
-            &exchange as &dyn duckdb::ToSql,
+            &step,
+            &step,
+            &price_prec,
+            &qty_prec,
+            &qty_prec,
+            &q.symbol,
+            &exchange,
         ];
         if let Some(ref from) = q.from {
             params.push(from);
@@ -638,14 +634,14 @@ impl BatchWriter {
 
         for t in trades {
             appender
-                .append_row([
-                    &t.exchange as &dyn duckdb::ToSql,
-                    &t.symbol as &dyn duckdb::ToSql,
-                    &(t.trade.time.as_u64() as i64) as &dyn duckdb::ToSql,
-                    &t.trade.price.to_f64() as &dyn duckdb::ToSql,
-                    &t.trade.qty.to_f64() as &dyn duckdb::ToSql,
-                    &t.trade.is_sell as &dyn duckdb::ToSql,
-                ])
+                .append_row((
+                    &t.exchange,
+                    &t.symbol,
+                    t.trade.time.as_u64() as i64,
+                    t.trade.price.to_f64(),
+                    t.trade.qty.to_f64(),
+                    t.trade.is_sell,
+                ))
                 .context("appending row via DuckDB appender")?;
         }
 
