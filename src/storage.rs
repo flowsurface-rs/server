@@ -545,55 +545,138 @@ impl Storage {
     /// Spawn a background task that receives trades on `rx`, buffers them,
     /// and flushes to DuckDB via the Appender API every `flush_interval`.
     ///
+    /// The flusher uses an interval-first biased select so that flushes
+    /// always get a turn regardless of incoming trade volume.  A
+    /// `max_buffered_trades` cap prevents runaway memory growth on
+    /// constrained hosts — once the buffer exceeds this threshold
+    /// incoming trades are silently dropped and a rate-limited warning
+    /// is emitted.  The warning clears automatically when the buffer is
+    /// flushed below capacity.
+    ///
+    /// DuckDB I/O runs on a **blocking thread** via `spawn_blocking` so
+    /// that a stalled disk or fsync cannot stall the async task.  The
+    /// channel continues to be drained into our capped buffer while the
+    /// blocking flush is in-flight, ensuring the buffer cap is always
+    /// effective.
+    ///
     /// Uses the shared `duckdb_database` from `storage` so that flushed
     /// trades are immediately visible to reader connections.
     pub fn spawn_batch_flusher(
         &self,
-        mut rx: mpsc::Receiver<AnnotatedTrade>,
+        mut rx: mpsc::UnboundedReceiver<AnnotatedTrade>,
         flush_interval: Duration,
+        max_buffered_trades: usize,
     ) -> JoinHandle<()> {
         let storage = self.clone();
+
         tokio::spawn(async move {
             let mut buffer: Vec<AnnotatedTrade> = Vec::new();
+            let mut over_capacity_warned = false;
+
+            // Track an in-flight blocking flush so we don't pile multiple
+            // flushes on the blocking thread pool.
+            let mut flush_handle: Option<JoinHandle<anyhow::Result<()>>> = None;
 
             let mut interval = tokio::time::interval(flush_interval);
             interval.reset_immediately();
 
-            let mut writer = match storage.open_writer() {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!("Failed to open batch writer: {e:#}");
-                    return;
-                }
-            };
-
             loop {
+                if let Some(ref h) = flush_handle
+                    && h.is_finished()
+                {
+                    let handle = flush_handle.take().unwrap();
+                    match handle.await {
+                        Ok(Ok(())) => {
+                            if over_capacity_warned {
+                                tracing::info!(
+                                    "Trade buffer flushed; back within capacity \
+                                         (max {max_buffered_trades})."
+                                );
+                                over_capacity_warned = false;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                "Batch flush failed ({} trades in new buffer, \
+                                 failed batch dropped): {e:#}",
+                                buffer.len()
+                            );
+                        }
+                        Err(_) => {
+                            tracing::error!("Batch flush task panicked or cancelled");
+                        }
+                    }
+                }
+
                 tokio::select! {
                     biased;
+                    _ = interval.tick() => {
+                        // Non-blocking drain: grab everything queued since the
+                        // last tick.  Must drain unconditionally to prevent the
+                        // unbounded channel's own internal buffer from growing
+                        // unchecked — but only buffer up to the cap.
+                        while let Ok(trade) = rx.try_recv() {
+                            if buffer.len() < max_buffered_trades {
+                                buffer.push(trade);
+                            } else if !over_capacity_warned {
+                                tracing::warn!(
+                                    "Trade buffer exceeded {max_buffered_trades} — \
+                                     dropping trades to protect against OOM. \
+                                     This warning is rate-limited."
+                                );
+                                over_capacity_warned = true;
+                            }
+                        }
+
+                        // Spawn a blocking flush if we have data and none is
+                        // currently in-flight on the blocking thread pool.
+                        if !buffer.is_empty() && flush_handle.is_none() {
+                            let batch = std::mem::take(&mut buffer);
+                            let storage2 = storage.clone();
+                            flush_handle = Some(tokio::spawn(async move {
+                                tokio::task::spawn_blocking(move || {
+                                    let mut writer = storage2.open_writer()?;
+                                    writer.flush(&batch)
+                                })
+                                .await
+                                .context("blocking flush panicked")?
+                            }));
+                        }
+                    }
                     maybe = rx.recv() => {
                         match maybe {
-                            Some(trade) => buffer.push(trade),
+                            Some(trade) => {
+                                if buffer.len() < max_buffered_trades {
+                                    buffer.push(trade);
+                                } else if !over_capacity_warned {
+                                    tracing::warn!(
+                                        "Trade buffer exceeded {max_buffered_trades} — \
+                                         dropping trades to protect against OOM. \
+                                         This warning is rate-limited."
+                                    );
+                                    over_capacity_warned = true;
+                                }
+                            }
                             None => {
-                                if !buffer.is_empty() && let Err(e) = writer.flush(&buffer) {
-                                    tracing::error!("Final flush failed: {e:#}");
+                                // Channel closed: wait for in-flight flush,
+                                // then flush whatever is left in our buffer
+                                // in one last blocking call.
+                                if let Some(handle) = flush_handle.take() && let Err(e) = handle.await {
+                                    tracing::error!("Final flush task failed: {e:#}");
+                                }
+                                if !buffer.is_empty() {
+                                    let storage2 = storage.clone();
+                                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                                        let mut writer = storage2.open_writer()?;
+                                        writer.flush(&buffer)
+                                    })
+                                    .await
+                                    {
+                                        tracing::error!("Final flush failed: {e:#}");
+                                    }
                                 }
                                 tracing::info!("Batch flusher channel closed.");
                                 break;
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if !buffer.is_empty() {
-                            match writer.flush(&buffer) {
-                                Ok(()) => {
-                                    buffer.clear();
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Batch flush failed ({} buffered trades kept for retry): {e:#}",
-                                        buffer.len()
-                                    );
-                                }
                             }
                         }
                     }

@@ -69,6 +69,15 @@ pub struct Config {
     /// Default: `"flowsurface-server"`.
     #[serde(default = "default_tls_domain")]
     pub tls_domain: String,
+
+    /// Maximum number of trades to buffer in memory before dropping
+    /// incoming trades to prevent OOM on constrained hosts.
+    /// Trades are still received from the WebSocket (WS reader never
+    /// blocks), but once this ceiling is reached new trades are
+    /// silently dropped until the buffer is flushed to DuckDB.
+    /// Default: 200_000 (~20–40 MB depending on symbol length).
+    #[serde(default = "default_max_buffered_trades")]
+    pub max_buffered_trades: usize,
 }
 
 const fn default_flush_interval() -> u64 {
@@ -85,6 +94,10 @@ const fn default_true() -> bool {
 
 fn default_tls_domain() -> String {
     "flowsurface-server".to_string()
+}
+
+const fn default_max_buffered_trades() -> usize {
+    200_000
 }
 
 impl Config {

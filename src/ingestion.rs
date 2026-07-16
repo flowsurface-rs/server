@@ -17,7 +17,7 @@ use crate::api::AnnotatedTrade;
 pub async fn start_all_ingest_tasks(
     pairs: &[TickerInfo],
     handles: AdapterHandles,
-    tx: mpsc::Sender<AnnotatedTrade>,
+    tx: mpsc::UnboundedSender<AnnotatedTrade>,
     shutdown: CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut by_exchange: HashMap<Exchange, Vec<TickerInfo>> = HashMap::new();
@@ -52,7 +52,7 @@ async fn run_exchange_ingestion(
     handles: AdapterHandles,
     exchange: Exchange,
     ticker_infos: Vec<TickerInfo>,
-    tx: mpsc::Sender<AnnotatedTrade>,
+    tx: mpsc::UnboundedSender<AnnotatedTrade>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let symbols: Vec<String> = ticker_infos
@@ -82,7 +82,7 @@ async fn run_exchange_ingestion(
                                 for ft_trade in trades.iter() {
                                     let normalized = AnnotatedTrade::new(ticker_info, *ft_trade);
 
-                                    if tx.send(normalized).await.is_err() {
+                                    if tx.send(normalized).is_err() {
                                         tracing::info!(%exchange, "Trade channel closed, stopping ingest");
                                         return Ok(());
                                     }

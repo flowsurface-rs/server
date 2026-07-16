@@ -58,6 +58,7 @@ struct App {
     bind_address: String,
     auth_token: Option<String>,
     flush_interval: std::time::Duration,
+    max_buffered_trades: usize,
     data_retention_hours: u64,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
 }
@@ -209,6 +210,7 @@ impl App {
             bind_address: config.bind_address.clone(),
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
+            max_buffered_trades: config.max_buffered_trades,
             data_retention_hours: config.data_retention_hours,
             tls_config,
         }
@@ -216,12 +218,14 @@ impl App {
 
     /// Start the pipeline (flusher, cleanup, ingest) and the HTTP server.
     async fn serve(self) -> AppHandles {
-        let (trade_tx, trade_rx) = mpsc::channel::<api::AnnotatedTrade>(1024);
+        let (trade_tx, trade_rx) = mpsc::unbounded_channel::<api::AnnotatedTrade>();
         let shutdown = CancellationToken::new();
 
-        let flusher = self
-            .storage
-            .spawn_batch_flusher(trade_rx, self.flush_interval);
+        let flusher = self.storage.spawn_batch_flusher(
+            trade_rx,
+            self.flush_interval,
+            self.max_buffered_trades,
+        );
 
         let _cleanup = self
             .storage
@@ -270,7 +274,7 @@ impl App {
 /// Runtime handles for the active pipeline — provides ordered shutdown.
 struct AppHandles {
     shutdown: CancellationToken,
-    _trade_tx: mpsc::Sender<api::AnnotatedTrade>,
+    _trade_tx: mpsc::UnboundedSender<api::AnnotatedTrade>,
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
     ingest: Vec<tokio::task::JoinHandle<()>>,

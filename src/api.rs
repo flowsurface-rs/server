@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::get,
@@ -151,7 +151,11 @@ impl Server {
 
     /// Check whether the request carries a valid Bearer token.
     /// Returns `Ok(())` if no auth is configured or the token matches.
-    fn check_auth(&self, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
+    fn check_auth(
+        &self,
+        headers: &HeaderMap,
+        peer_addr: SocketAddr,
+    ) -> Result<(), (StatusCode, &'static str)> {
         let Some(ref expected_token) = self.auth_token else {
             return Ok(());
         };
@@ -164,14 +168,10 @@ impl Server {
         let expected = format!("Bearer {expected_token}");
 
         if !provided.eq_ignore_ascii_case(&expected) {
-            let client_ip = headers
-                .get("X-Forwarded-For")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown");
-
             let truncated: String = provided.chars().take(20).collect();
             tracing::warn!(
-                "Auth failure from {client_ip}: expected valid Bearer token, got '{truncated}'"
+                "Auth failure from {}: expected valid Bearer token, got '{truncated}'",
+                peer_addr.ip(),
             );
             return Err((StatusCode::UNAUTHORIZED, "missing or invalid auth token"));
         }
@@ -379,7 +379,7 @@ impl Server {
             if let Some(cfg) = tls_config {
                 tracing::info!("Starting HTTPS API on {addr}");
                 axum_server::bind_rustls(addr, cfg)
-                    .serve(router.into_make_service())
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             } else {
@@ -390,7 +390,12 @@ impl Server {
                         tracing::error!("Failed to bind to {addr}: {e}");
                         std::process::exit(1);
                     });
-                axum::serve(listener, router).await.unwrap();
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
             }
         })
     }
@@ -400,11 +405,12 @@ impl Server {
 /// Returns a JSON error body on auth failure for consistency with the rest of the API.
 async fn auth_middleware(
     State(state): State<Arc<Server>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Err((status, msg)) = state.check_auth(&headers) {
+    if let Err((status, msg)) = state.check_auth(&headers, peer_addr) {
         return Server::json_err(status, msg);
     }
     next.run(req).await

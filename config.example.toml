@@ -30,6 +30,14 @@ base_assets = ["BTC", "ETH"]
 # before deciding what to track.  Default: true.
 # discovery_mode = true
 
+# Maximum trades to buffer in memory before dropping to prevent OOM.
+# Tune based on your host RAM and risk tolerance:
+#   200k (~20-40 MB) — safe for 1 GB hosts
+#   1.2M (~120-240 MB) — ~2 min buffer at 10k trades/sec
+# Higher values reduce data-loss during DB outages but use more memory.
+# Default: 200000.
+# max_buffered_trades = 200000
+
 [whitelist.binance]
 spot = ["USDT"]
 linear = ["USDT", "USDC"]
