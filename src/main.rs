@@ -123,21 +123,8 @@ impl App {
         );
 
         // Persist ticker metadata for the API layer.
-        {
-            let records = resolved_pairs
-                .iter()
-                .map(|ti| storage::TickerInfoRecord {
-                    exchange: ti.exchange().to_string(),
-                    symbol: ti.ticker.to_string().to_lowercase(),
-                    min_ticksize: ti.min_ticksize.power,
-                    min_qty: ti.min_qty.power,
-                    contract_size: ti.contract_size.map(|cs| cs.power),
-                })
-                .collect::<Vec<_>>();
-
-            if let Err(e) = storage.store_ticker_infos(&records) {
-                tracing::warn!("Failed to persist ticker metadata: {e:#}");
-            }
+        if let Err(e) = storage.store_ticker_infos(&resolved_pairs) {
+            tracing::warn!("Failed to persist ticker metadata: {e:#}");
         }
 
         // Only generate TLS cert for non-loopback addresses.

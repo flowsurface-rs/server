@@ -11,7 +11,10 @@ use axum::{
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use flowsurface_exchange::{TickerInfo, Trade};
+use flowsurface_exchange::{
+    TickerInfo, Trade,
+    adapter::{Exchange, MarketKind, Venue},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{GroupedTrade, PairInfo, Storage};
@@ -32,26 +35,26 @@ pub struct Server {
 }
 
 #[derive(Serialize)]
-struct StatusResponse {
-    status: &'static str,
-    uptime_secs: u64,
-    db_ok: bool,
-}
-
-#[derive(Serialize)]
-struct PairsResponse {
-    pairs: Vec<PairInfo>,
-    tracked_count: usize,
-}
-
-#[derive(Serialize)]
-struct TradesResponse {
-    trades: Vec<AnnotatedTrade>,
-}
-
-#[derive(Serialize)]
-struct GroupedTradesResponse {
-    trades: Vec<GroupedTrade>,
+#[serde(untagged)]
+enum Response {
+    Status {
+        status: &'static str,
+        uptime_secs: u64,
+        db_ok: bool,
+    },
+    Pairs {
+        pairs: Vec<PairInfo>,
+        tracked_count: usize,
+    },
+    Trades {
+        trades: Vec<AnnotatedTrade>,
+    },
+    GroupedTrades {
+        trades: Vec<GroupedTrade>,
+    },
+    Exchanges {
+        exchanges: HashMap<String, Vec<String>>,
+    },
 }
 
 /// A normalized trade record, used both in-memory and serialized to JSON.
@@ -106,6 +109,22 @@ pub struct TradeQuery {
     pub limit: Option<usize>,
 }
 
+impl TradeQuery {
+    /// Derive an exchange filter string from a `TradeQuery`'s `venue` + `market`.
+    pub fn exchange_filter(self: &TradeQuery) -> String {
+        exchange_from_venue_market(&self.venue, &self.market)
+            .unwrap_or_else(|| format!("{}/{}", self.venue, self.market))
+    }
+}
+
+/// Derive the canonical exchange string from raw `venue` + `market` strings.
+pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
+    let venue_enum: Venue = venue.parse().ok()?;
+    let market_enum: MarketKind = market.parse().ok()?;
+
+    Exchange::from_venue_and_market(venue_enum, market_enum).map(|ex| ex.to_string())
+}
+
 /// Query parameters for the GET /trades/grouped endpoint.
 #[derive(Debug, Deserialize)]
 pub struct GroupedTradeQuery {
@@ -124,11 +143,6 @@ pub struct GroupedTradeQuery {
     /// Integer multiplier applied to the exchange's minimum tick size
     /// to produce the price bucket width (default 1).
     step: Option<u16>,
-}
-
-#[derive(Serialize)]
-struct ExchangesResponse {
-    exchanges: HashMap<String, Vec<String>>,
 }
 
 impl Server {
@@ -207,7 +221,7 @@ impl Server {
         let uptime = state.startup.elapsed().as_secs();
         let db_ok = state.storage.pair_count().is_ok();
 
-        Self::json_ok(&StatusResponse {
+        Self::json_ok(&Response::Status {
             status: "ok",
             uptime_secs: uptime,
             db_ok,
@@ -220,7 +234,7 @@ impl Server {
     /// the exchange APIs at startup.  Useful for discovering the correct suffix
     /// patterns when configuring `config.toml`.
     async fn exchanges(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        Self::json_ok(&ExchangesResponse {
+        Self::json_ok(&Response::Exchanges {
             exchanges: state.available_tickers.clone(),
         })
     }
@@ -260,7 +274,7 @@ impl Server {
         }
 
         let count = merged.len();
-        Self::json_ok(&PairsResponse {
+        Self::json_ok(&Response::Pairs {
             pairs: merged,
             tracked_count: count,
         })
@@ -269,7 +283,7 @@ impl Server {
     /// GET /trades
     async fn trades(State(state): State<Arc<Self>>, query: Query<TradeQuery>) -> impl IntoResponse {
         match state.storage.query_trades(&query) {
-            Ok(trades) => Self::json_ok(&TradesResponse { trades }),
+            Ok(trades) => Self::json_ok(&Response::Trades { trades }),
             Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     }
@@ -280,7 +294,7 @@ impl Server {
         query: Query<GroupedTradeQuery>,
     ) -> impl IntoResponse {
         // Derive the canonical exchange string from venue + market.
-        let ex_str = match Storage::exchange_from_venue_market(&query.venue, &query.market) {
+        let ex_str = match exchange_from_venue_market(&query.venue, &query.market) {
             Some(ex) => ex,
             None => {
                 return Self::json_err(
@@ -307,18 +321,18 @@ impl Server {
         // Compute the bucket width: min_ticksize × step multiplier.
         // `step` is an integer (e.g. 1, 2, 5, 50) — never a raw decimal.
         let multiplier = query.step.unwrap_or(1).max(1) as f64;
-        let step_size = 10.0_f64.powi(info.min_ticksize as i32) * multiplier;
+        let step_size = 10.0_f64.powi(info.min_ticksize.power as i32) * multiplier;
 
         // Derive price precision from min_ticksize (e.g. power -1 → 1 decimal place).
-        let price_precision = if info.min_ticksize < 0 {
-            -info.min_ticksize as u32
+        let price_precision = if info.min_ticksize.power < 0 {
+            -info.min_ticksize.power as u32
         } else {
             0
         };
 
         // Derive quantity precision from min_qty (e.g. power -3 → 3 decimal places).
-        let qty_precision = if info.min_qty < 0 {
-            -info.min_qty as u32
+        let qty_precision = if info.min_qty.power < 0 {
+            -info.min_qty.power as u32
         } else {
             0
         };
@@ -339,7 +353,7 @@ impl Server {
             price_precision,
             qty_precision,
         ) {
-            Ok(trades) => Self::json_ok(&GroupedTradesResponse { trades }),
+            Ok(trades) => Self::json_ok(&Response::GroupedTrades { trades }),
             Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     }
