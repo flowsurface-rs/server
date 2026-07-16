@@ -9,47 +9,34 @@ a REST API.
 ```bash
 # 1. Configure
 cp config.example.toml config.toml
-# edit config.toml with your ticker whitelist
 
 # 2. Run
 ./flowsurface-server                              # config.toml next to binary or CWD
 ./flowsurface-server --config /path/to/config.toml
 ```
 
-Use `--config <path>` to specify a custom config location. The server looks for
-`config.toml` next to the binary first, then in the current working directory.
-
-The server auto-detects everything else:
+## Configuration
 
 | Situation                         | Behaviour                                                          |
 | --------------------------------- | ------------------------------------------------------------------ |
 | `bind_address = "127.0.0.1:8080"` | Plain HTTP, no auth                                                |
 | `bind_address = "0.0.0.0:8080"`   | HTTPS (self-signed cert), auth token + cert. fingerprint generated |
 
-## Configuration
-
 ### `config.toml`
 
 ```toml
-bind_address = "127.0.0.1:8080"  # use 0.0.0.0:8080 for remote access
-data_dir = "./data"
+bind_address = "127.0.0.1:8080"   # use 0.0.0.0:8080 for remote access
+data_dir = "./data"               # data, auth token, TLS certs, DuckDB
 
-base_assets = ["BTC", "ETH"]
+base_assets = ["BTC", "ETH"]      # assets expanded via whitelist templates
 
-[whitelist.binance]
-spot = ["USDT"]
-linear = ["USDT", "USDC"]
-inverse = ["USD"]
+[whitelist.binance]               # per-exchange whitelist section
+spot = ["USDT"]                   # spot markets: base_assets paired with USDT
+linear = ["USDT", "USDC"]         # linear futures: base_assets paired with USDT/USDC
+inverse = ["USD"]                 # inverse futures: base_assets paired with USD
 ```
 
 See `config.example.toml` for all available options.
-
-### Discovery mode
-
-By default, the server fetches metadata for **all** supported exchanges on
-startup, so `/exchanges` is fully populated with every available ticker.
-Set `discovery_mode = false` in `config.toml` to skip exchanges not in your
-whitelist and reduce startup time.
 
 ### Authentication (`AUTH_TOKEN`)
 
@@ -70,9 +57,6 @@ You can also set a specific token manually via env var:
 echo 'AUTH_TOKEN="your-token"' > .env
 ```
 
-The token is **never** stored in `config.toml`. Sent by clients as
-`Authorization: Bearer <token>`.
-
 ## Remote deployment (VPS)
 
 The server automatically enables HTTPS with a **self-signed certificate**
@@ -80,10 +64,16 @@ when binding to a non-loopback address (e.g. `0.0.0.0:8080`).
 
 1. Set `bind_address = "0.0.0.0:8080"` in `config.toml`
 2. Start the server — it generates:
-    - `data/cert.pem` + `data/key.pem` (self-signed TLS cert)
+    - `data/cert.pem` + `data/key.pem` (self-signed TLS cert. for optional setup)
     - `data/.auth_token` (random 256-bit token, if none set)
-3. (Optional) The server logs the certificate's SHA-256 fingerprint at startup.
-4. Clients can now use `https://vps-ip:8080` with the generated auth token.
+3. Clients can now use `https://vps-ip:8080` with the generated auth
+   token — note the cert is self-signed, so most HTTP clients need an
+   explicit flag to accept it (e.g. `curl -k`, `verify=False` in
+   `requests`, `.danger_accept_invalid_certs(true)` in `reqwest`, etc.) unless verifying against `cert.pem` directly.
+
+> If you can't connect, check that the port is reachable: some cloud providers
+> block inbound ports by default and require an explicit
+> firewall/security-group rule.
 
 #### Connecting via a domain name
 
@@ -106,7 +96,7 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 
 - Plain HTTP (no TLS overhead)
 - No auth token required
-- `curl http://127.0.0.1:8080/status` works directly
+- `curl http://127.0.0.1:8080/pairs` works directly
 
 ## API endpoints
 
@@ -216,21 +206,3 @@ auth is configured.
     ]
 }
 ```
-
-## Architecture
-
-```
-Exchange WS ─▶ flowsurface-server ─▶ DuckDB
-                    │
-                    ▼
-              REST API (HTTP/HTTPS)
-                    │
-                    ▼
-                  Client
-```
-
-- `flowsurface-exchange` adapters connect to exchange WebSocket streams
-- Trades are buffered in memory and flushed to DuckDB in batches
-- Data retention is enforced (old trades purged periodically)
-- The HTTP API serves queries directly from DuckDB
-- A self-signed TLS cert is auto-generated for remote access; its SHA-256 fingerprint is logged at startup for optional client-side pinning

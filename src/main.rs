@@ -14,11 +14,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+use flowsurface_exchange::TickerInfo;
 use flowsurface_exchange::adapter::{AdapterHandles, Venue};
 
 use crate::api::Server;
 use crate::config::{Args, Config};
-use crate::discovery::ResolvedPair;
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -53,7 +53,7 @@ async fn main() {
 struct App {
     storage: Storage,
     adapter_handles: AdapterHandles,
-    resolved_pairs: Vec<ResolvedPair>,
+    resolved_pairs: Vec<TickerInfo>,
     metadata_cache: discovery::MetadataCache,
     bind_address: String,
     auth_token: Option<String>,
@@ -116,7 +116,7 @@ impl App {
             resolved_pairs.len(),
             resolved_pairs
                 .iter()
-                .map(|p| p.exchange)
+                .map(|ti| ti.exchange())
                 .collect::<std::collections::HashSet<_>>()
                 .len()
         );
@@ -125,12 +125,12 @@ impl App {
         {
             let records = resolved_pairs
                 .iter()
-                .map(|p| storage::TickerInfoRecord {
-                    exchange: p.exchange.to_string(),
-                    symbol: p.ticker_info.ticker.to_string().to_lowercase(),
-                    min_ticksize: p.ticker_info.min_ticksize.power,
-                    min_qty: p.ticker_info.min_qty.power,
-                    contract_size: p.ticker_info.contract_size.map(|cs| cs.power),
+                .map(|ti| storage::TickerInfoRecord {
+                    exchange: ti.exchange().to_string(),
+                    symbol: ti.ticker.to_string().to_lowercase(),
+                    min_ticksize: ti.min_ticksize.power,
+                    min_qty: ti.min_qty.power,
+                    contract_size: ti.contract_size.map(|cs| cs.power),
                 })
                 .collect::<Vec<_>>();
 
@@ -140,7 +140,6 @@ impl App {
         }
 
         // Only generate TLS cert for non-loopback addresses.
-        // On localhost plain HTTP is used — no overhead, no cert needed.
         let addr: std::net::SocketAddr = config
             .bind_address
             .parse()
@@ -239,10 +238,10 @@ impl App {
         let configured_pairs: Vec<(String, String)> = self
             .resolved_pairs
             .iter()
-            .map(|p| {
+            .map(|ti| {
                 (
-                    p.exchange.to_string(),
-                    p.ticker_info.ticker.to_string().to_lowercase(),
+                    ti.exchange().to_string(),
+                    ti.ticker.to_string().to_lowercase(),
                 )
             })
             .collect();

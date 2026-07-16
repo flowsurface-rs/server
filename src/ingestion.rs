@@ -9,26 +9,20 @@ use flowsurface_exchange::adapter::{AdapterHandles, Event, Exchange, StreamConfi
 use flowsurface_exchange::{PushFrequency, TickerInfo};
 
 use crate::api::AnnotatedTrade;
-use crate::discovery::ResolvedPair;
 
 /// Start ingest tasks for every resolved pair, grouped by exchange.
 ///
 /// Each exchange gets one task that subscribes a single trade stream
 /// for all its tickers.
 pub async fn start_all_ingest_tasks(
-    pairs: &[ResolvedPair],
+    pairs: &[TickerInfo],
     handles: AdapterHandles,
     tx: mpsc::Sender<AnnotatedTrade>,
     shutdown: CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    // Group `ResolvedPair`s by their Flowsurface `Exchange` so we can
-    // open one trade stream per exchange.
     let mut by_exchange: HashMap<Exchange, Vec<TickerInfo>> = HashMap::new();
-    for pair in pairs {
-        by_exchange
-            .entry(pair.exchange)
-            .or_default()
-            .push(pair.ticker_info);
+    for ti in pairs {
+        by_exchange.entry(ti.exchange()).or_default().push(*ti);
     }
 
     let mut tasks = Vec::new();

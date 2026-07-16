@@ -5,13 +5,6 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::config::WhitelistTemplates;
 
-/// A fully-resolved tracked pair that the ingestion layer can use.
-#[derive(Debug, Clone)]
-pub struct ResolvedPair {
-    pub exchange: Exchange,
-    pub ticker_info: TickerInfo,
-}
-
 pub type MetadataCache = HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>;
 
 /// Flatten the metadata cache into a map of exchange → available ticker symbols.
@@ -157,7 +150,7 @@ pub fn resolve_pairs(
     base_assets: &[String],
     templates: &WhitelistTemplates,
     cache: &MetadataCache,
-) -> Vec<ResolvedPair> {
+) -> Vec<TickerInfo> {
     let mut pairs = Vec::new();
     let mut seen: HashSet<(Exchange, Ticker)> = HashSet::new();
 
@@ -200,10 +193,7 @@ pub fn resolve_pairs(
                                     .is_some_and(|d| d.starts_with(&base_upper));
 
                             if matches_base && seen.insert((exchange, *ticker)) {
-                                pairs.push(ResolvedPair {
-                                    exchange,
-                                    ticker_info: *ti,
-                                });
+                                pairs.push(*ti);
                             }
                         }
                         continue;
@@ -235,10 +225,7 @@ pub fn resolve_pairs(
                     match found {
                         Some(ti) => {
                             if seen.insert((exchange, ti.ticker)) {
-                                pairs.push(ResolvedPair {
-                                    exchange,
-                                    ticker_info: ti,
-                                });
+                                pairs.push(ti);
                             }
                         }
                         None => {

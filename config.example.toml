@@ -1,10 +1,9 @@
-# By default it looks for "config.toml" next to the binary.
-# Use --config <path> to override.
-#
-# See README.md for full documentation.
-
 bind_address = "127.0.0.1:8080"
 data_dir = "./data"
+
+# Domain name for the self-signed TLS certificate's SAN (Subject Alternative Names).
+# Ignored on loopback binds (plain HTTP).  Default: "flowsurface-server".
+# tls_domain = "data.example.com"
 
 # Trade batch-flush interval in milliseconds.
 # Lower values reduce data loss on crash/failure; higher values are more I/O-efficient
@@ -23,17 +22,13 @@ base_assets = ["BTC", "ETH"]
 # To exclude a venue entirely, omit it from the whitelist.
 # To exclude a market kind for a venue, omit that key.
 #
-# Tip: `http://<bind_address>/exchanges` shows all available tickers that can be tracked. 
+# Tip: `http(s)://<bind_address>/exchanges` shows all available tickers that can be tracked. 
 # use `[""]` (empty string) as a wildcard to track all `base_assets` regardless of the quote on that venue+market
 #
 # Discovery mode: fetches and caches metadata for ALL supported exchanges on startup
 # so `/exchanges` is fully populated.  Lets you browse available tickers
 # before deciding what to track.  Default: true.
 # discovery_mode = true
-
-# Domain name for the self-signed TLS certificate's SAN (Subject Alternative Names).
-# Ignored on loopback binds (plain HTTP).  Default: "flowsurface-server".
-# tls_domain = "data.example.com"
 
 [whitelist.binance]
 spot = ["USDT"]
