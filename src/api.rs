@@ -289,6 +289,48 @@ impl Server {
         }
     }
 
+    /// GET /trades.parquet
+    ///
+    /// Returns trades as a **real Parquet** file, exported directly from
+    /// DuckDB via `COPY (SELECT ...) TO 'file.parquet'`.  The Parquet
+    /// schema uses the same 4 columns the Rust client expects:
+    /// `ts (int64)`, `price (double)`, `qty (double)`, `is_sell (bool)`.
+    async fn trades_parquet(
+        State(state): State<Arc<Self>>,
+        query: Query<TradeQuery>,
+    ) -> axum::response::Response {
+        let limit = query.limit.unwrap_or(10_000).min(100_000);
+
+        let mut bounded = query.0;
+        bounded.limit = Some(limit);
+
+        let parquet_bytes = match state.storage.query_trades_parquet(&bounded) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Server::json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("parquet export: {e:#}"),
+                );
+            }
+        };
+
+        (
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.apache.parquet",
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"trades.parquet\"",
+                ),
+            ],
+            parquet_bytes,
+        )
+            .into_response()
+    }
+
     /// GET /trades/grouped
     ///
     /// Returns up to `limit` consecutive time buckets, each `timeframe` wide.
@@ -411,6 +453,7 @@ impl Server {
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
+            .route("/trades.parquet", get(Server::trades_parquet))
             .route("/trades/grouped", get(Server::grouped_trades))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),

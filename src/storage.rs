@@ -197,6 +197,70 @@ impl Storage {
         Ok(trades)
     }
 
+    /// Export matching trades as a **real Parquet** byte blob.
+    ///
+    /// Writes a temporary Parquet file via DuckDB's native `COPY .. TO`
+    /// and returns the contents.  The temporary file is cleaned up after
+    /// reading.
+    ///
+    /// Uses a generous row cap appropriate for bulk Parquet downloads.
+    pub fn query_trades_parquet(&self, q: &TradeQuery) -> Result<Vec<u8>> {
+        let conn = self.connection()?;
+
+        let limit = q.limit.unwrap_or(100_000).min(1_000_000);
+        let exchange = q.exchange_filter();
+        let symbol_lower = q.symbol.to_lowercase();
+
+        // Escape single-quotes for inline SQL safety.
+        let exch_esc = exchange.replace('\'', "''");
+        let sym_esc = symbol_lower.replace('\'', "''");
+
+        let mut inner = format!(
+            "SELECT ts, price, qty, is_sell FROM trades \
+             WHERE symbol = '{sym_esc}' AND exchange = '{exch_esc}'",
+        );
+
+        if let Some(from) = q.from {
+            inner.push_str(&format!(" AND ts >= {from}"));
+        }
+        if let Some(to) = q.to {
+            inner.push_str(&format!(" AND ts <= {to}"));
+        }
+
+        if q.from.is_some() {
+            inner.push_str(" ORDER BY ts ASC");
+        } else {
+            inner.push_str(" ORDER BY ts DESC");
+        }
+        inner.push_str(&format!(" LIMIT {limit}"));
+
+        // Unique temp-file path (PID + timestamp).
+        let tmp_dir = std::env::temp_dir();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_path = tmp_dir.join(format!("trades_{}_{}.parquet", std::process::id(), now_ns));
+        let tmp_str = tmp_path.display().to_string();
+
+        // Single-shot COPY TO — DuckDB parses the inner SELECT itself.
+        // The `parquet` Cargo feature is required so the extension is
+        // statically linked; otherwise DuckDB tries to autoload at
+        // runtime and segfaults in an offline environment.
+        let copy_sql = format!("COPY ({inner}) TO '{tmp_str}' (FORMAT 'parquet', CODEC 'zstd')",);
+
+        conn.execute_batch(&copy_sql)
+            .context("exporting trades to Parquet file")?;
+
+        let bytes = std::fs::read(&tmp_path).context("reading Parquet file")?;
+
+        // Best-effort cleanup.
+        std::fs::remove_file(&tmp_path).ok();
+
+        tracing::debug!("Exported {} bytes of Parquet data", bytes.len());
+        Ok(bytes)
+    }
+
     /// Persist ticker metadata for every resolved pair so the API can
     /// look up tick sizes at query time.
     pub fn store_ticker_infos(&self, infos: &[TickerInfo]) -> Result<()> {
