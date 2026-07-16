@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use flowsurface_exchange::TickerInfo;
 use flowsurface_exchange::adapter::{AdapterHandles, Venue};
+use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
 use crate::config::{Args, Config};
@@ -226,19 +226,8 @@ impl App {
         )
         .await;
 
-        let configured_pairs: Vec<(String, String)> = self
-            .resolved_pairs
-            .iter()
-            .map(|ti| {
-                (
-                    ti.exchange().to_string(),
-                    ti.ticker
-                        .display_symbol()
-                        .map(|s| s.to_lowercase())
-                        .unwrap_or_else(|| ti.ticker.to_string().to_lowercase()),
-                )
-            })
-            .collect();
+        let configured_pairs: Vec<Ticker> =
+            self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
 
         let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
         let server = Arc::new(Server::new(

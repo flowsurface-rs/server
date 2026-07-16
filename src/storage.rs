@@ -27,10 +27,9 @@ pub struct GroupedTrade {
 }
 
 /// Information about a tracked pair with the timestamp range stored.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PairInfo {
-    pub exchange: String,
-    pub symbol: String,
+    pub ticker: Ticker,
     pub earliest: Option<UnixMs>,
     pub latest: Option<UnixMs>,
 }
@@ -367,9 +366,17 @@ impl Storage {
         )?;
 
         let rows = stmt.query_map([], |row| {
+            let exchange_str: String = row.get(0)?;
+            let symbol_str: String = row.get(1)?;
+            let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
+                duckdb::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cannot parse exchange '{exchange_str}': {e}"),
+                )))
+            })?;
+
             Ok(PairInfo {
-                exchange: row.get(0)?,
-                symbol: row.get(1)?,
+                ticker: Ticker::new(&symbol_str, exchange),
                 earliest: row.get::<_, Option<i64>>(2)?.map(|v| UnixMs::new(v as u64)),
                 latest: row.get::<_, Option<i64>>(3)?.map(|v| UnixMs::new(v as u64)),
             })

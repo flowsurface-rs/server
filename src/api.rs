@@ -124,9 +124,9 @@ pub struct Server {
     pub storage: Storage,
     pub startup: Instant,
     pub auth_token: Option<String>,
-    /// The set of (exchange, symbol) pairs configured at startup.
+    /// The tickers configured at startup.
     /// Used by `/pairs` to include pairs that have not yet received trades.
-    pub configured_pairs: Vec<(String, String)>,
+    pub configured_pairs: Vec<Ticker>,
     /// All available ticker symbols per exchange, from the metadata cache.
     /// Used by `/exchanges` to help users discover correct suffix patterns.
     pub available_tickers: HashMap<String, Vec<String>>,
@@ -139,7 +139,7 @@ impl Server {
     pub fn new(
         storage: Storage,
         auth_token: Option<String>,
-        configured_pairs: Vec<(String, String)>,
+        configured_pairs: Vec<Ticker>,
         available_tickers: HashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
     ) -> Self {
@@ -245,18 +245,24 @@ impl Server {
         let mut by_key: std::collections::HashMap<String, &PairInfo> =
             std::collections::HashMap::new();
         for p in &db_pairs {
-            by_key.insert(format!("{}:{}", p.exchange, p.symbol), p);
+            let ex_str = p.ticker.exchange.to_string();
+            let sym_str = p.ticker.to_string().to_lowercase();
+            by_key.insert(format!("{ex_str}:{sym_str}"), p);
         }
 
         // Merge: every configured pair gets a PairInfo; fill in DB bounds when available.
         let mut merged: Vec<PairInfo> = Vec::with_capacity(state.configured_pairs.len());
-        for (ex, sym) in &state.configured_pairs {
-            let key = format!("{ex}:{sym}");
+        for ticker in &state.configured_pairs {
+            let ex_str = ticker.exchange.to_string();
+            let sym_str = ticker
+                .display_symbol()
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| ticker.to_string().to_lowercase());
+            let key = format!("{ex_str}:{sym_str}");
             match by_key.get(&key) {
-                Some(found) => merged.push((*found).clone()),
+                Some(found) => merged.push(*(*found)),
                 None => merged.push(PairInfo {
-                    exchange: ex.clone(),
-                    symbol: sym.clone(),
+                    ticker: *ticker,
                     earliest: None,
                     latest: None,
                 }),
