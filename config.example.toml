@@ -10,9 +10,33 @@ data_dir = "./data"
 # (fewer fsyncs, larger columnar batches).  Default: 2000 (2 seconds).
 # flush_interval_ms = 2000
 
+# Maximum trades to buffer in memory before dropping to prevent OOM.
+# Tune based on your host RAM and risk tolerance:
+#   200k (~20-40 MB) — safe for 1 GB hosts
+#   1.2M (~120-240 MB) — ~2 min buffer at 10k trades/sec
+# Higher values reduce data-loss during DB outages but use more memory.
+# Default: 200000.
+# max_buffered_trades = 200000
+
 # Data retention period in hours.  Trades older than this will be purged
 # on startup (and periodically while running).  Default: 48 (2 days).
 # data_retention_hours = 48
+
+# Hard cap on total DuckDB database file size in megabytes.
+# When the database file size exceeds this value the oldest trades are
+# purged during cleanup — even if they're within the time-based retention
+# window.  Use this to prevent the database from quietly filling your disk
+# on small VPS hosts.
+#
+# Tip: set to ~50-80 % of your available disk space to leave room for
+# system files, logs, and bursts.
+# Default: no cap.
+# max_storage_mb = 4096
+
+# Discovery mode: fetches and caches metadata for ALL supported exchanges on startup
+# so `/exchanges` is fully populated.  Lets you browse available tickers
+# before deciding what to track.  Default: true.
+# discovery_mode = true
 
 # Base assets to track — expanded via the whitelist templates below.
 # The server fetches exchange metadata and resolves pairs at startup.
@@ -22,21 +46,7 @@ base_assets = ["BTC", "ETH"]
 # To exclude a venue entirely, omit it from the whitelist.
 # To exclude a market kind for a venue, omit that key.
 #
-# Tip: `http(s)://<bind_address>/exchanges` shows all available tickers that can be tracked. 
-# use `[""]` (empty string) as a wildcard to track all `base_assets` regardless of the quote on that venue+market
-#
-# Discovery mode: fetches and caches metadata for ALL supported exchanges on startup
-# so `/exchanges` is fully populated.  Lets you browse available tickers
-# before deciding what to track.  Default: true.
-# discovery_mode = true
-
-# Maximum trades to buffer in memory before dropping to prevent OOM.
-# Tune based on your host RAM and risk tolerance:
-#   200k (~20-40 MB) — safe for 1 GB hosts
-#   1.2M (~120-240 MB) — ~2 min buffer at 10k trades/sec
-# Higher values reduce data-loss during DB outages but use more memory.
-# Default: 200000.
-# max_buffered_trades = 200000
+# Use `[""]` (empty string) as a wildcard to track all `base_assets` regardless of the quote on that venue+market
 
 [whitelist.binance]
 spot = ["USDT"]

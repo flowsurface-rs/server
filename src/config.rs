@@ -78,6 +78,19 @@ pub struct Config {
     /// Default: 200_000 (~20–40 MB depending on symbol length).
     #[serde(default = "default_max_buffered_trades")]
     pub max_buffered_trades: usize,
+
+    /// Optional hard cap on total DuckDB storage (main DB + WAL) in
+    /// megabytes.  When the combined file size exceeds this value the
+    /// oldest trades are purged during cleanup — even if they're within
+    /// the time-based retention window.
+    ///
+    /// Use this to prevent the database from filling the disk on
+    /// constrained hosts.  Default: `None` (no size cap).
+    ///
+    /// Tip: set this to ~50-80 % of your available disk space so the
+    /// server leaves room for system files, logs, and burst.
+    #[serde(default)]
+    pub max_storage_mb: Option<u64>,
 }
 
 const fn default_flush_interval() -> u64 {

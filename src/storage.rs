@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use duckdb::{Appender, Connection};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,6 @@ use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 use crate::api::{AnnotatedTrade, TradeQuery};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 /// Information about a tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -33,6 +32,7 @@ pub struct PairInfo {
 #[derive(Clone)]
 pub struct Storage {
     db: Arc<parking_lot::Mutex<duckdb::Connection>>,
+    data_dir: PathBuf,
 }
 
 impl Storage {
@@ -87,7 +87,79 @@ impl Storage {
 
         Ok(Self {
             db: Arc::new(parking_lot::Mutex::new(root)),
+            data_dir: data_dir.to_path_buf(),
         })
+    }
+
+    /// Return the size (in bytes) of the main database file plus the
+    /// WAL file.  If a file does not (yet) exist its size is counted as 0.
+    pub fn current_storage_bytes(&self) -> Result<u64> {
+        let db_path = self.data_dir.join("trades.duckdb");
+        let wal_path = self.data_dir.join("trades.duckdb.wal");
+
+        let db_size = match std::fs::metadata(&db_path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(e).with_context(|| format!("checking size of {}", db_path.display()));
+            }
+        };
+
+        let wal_size = match std::fs::metadata(&wal_path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(e).with_context(|| format!("checking size of {}", wal_path.display()));
+            }
+        };
+
+        Ok(db_size + wal_size)
+    }
+
+    /// Return the total number of rows in the `trades` table.
+    ///
+    /// In DuckDB this is a cheap metadata operation on row-group
+    /// headers — safe to call frequently.
+    pub fn count_trades(&self) -> Result<u64> {
+        let conn = self.connection()?;
+        conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
+            .context("counting trades")
+    }
+
+    /// Delete the `batch_size` oldest trades (by `ts`) and return the
+    /// number of rows actually deleted.
+    pub fn delete_oldest_trades_batch(&self, batch_size: i64) -> Result<u64> {
+        let conn = self.connection()?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM trades WHERE rowid IN (\
+                     SELECT rowid FROM trades ORDER BY ts ASC LIMIT ?\
+                 )",
+                duckdb::params![batch_size],
+            )
+            .context("deleting oldest trades batch")?;
+        Ok(deleted as u64)
+    }
+
+    /// Rewrite the database file to reclaim filesystem space freed by
+    /// prior `DELETE` operations.  `CHECKPOINT` alone only merges the
+    /// WAL — it does not shrink the main file.  `VACUUM` is O(n) in
+    /// remaining rows, so callers should gate it behind a threshold.
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("VACUUM;")
+            .context("vacuuming DuckDB database")?;
+        Ok(())
+    }
+
+    /// Merge the DuckDB WAL into the main database file, then truncate
+    /// the WAL.  This prevents the `.wal` file from doubling the on-disk
+    /// footprint after a bulk delete.
+    pub fn run_checkpoint(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute_batch("CHECKPOINT;")
+            .context("checkpointing DuckDB WAL")?;
+        Ok(())
     }
 
     /// Open a dedicated connection for the batch writer (shares the
@@ -364,6 +436,13 @@ impl Storage {
         }
     }
 
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
     /// Delete every trade row whose `ts` (milliseconds since epoch) is
     /// older than `retention_hours`.  Returns the number of deleted rows.
     pub fn purge_old_trades(&self, retention_hours: u64) -> Result<u64> {
@@ -378,106 +457,10 @@ impl Storage {
         Ok(deleted as u64)
     }
 
-    /// Convenience: return the stored `last_cleanup` timestamp (milliseconds
-    /// since epoch), or `None` if cleanup has never run.
-    pub fn last_cleanup_ms(&self) -> Result<Option<i64>> {
-        self.get_metadata("last_cleanup")?
-            .map(|v| v.parse::<i64>().context("parsing last_cleanup metadata"))
-            .transpose()
-    }
-
-    pub fn record_cleanup(&self) -> Result<()> {
+    pub fn record_cleanup(&self) -> Result<i64> {
         let now_ms = Self::now_ms();
-        self.set_metadata("last_cleanup", &now_ms.to_string())
-    }
-
-    /// Run a single data-retention cleanup pass.
-    ///
-    /// Deletes trades older than `retention_hours` and records the
-    /// `last_cleanup` timestamp so callers can avoid running it again too soon.
-    pub fn run_cleanup(&self, retention_hours: u64) {
-        match self.purge_old_trades(retention_hours) {
-            Ok(n) => {
-                if n > 0 {
-                    tracing::info!("Cleaned up {n} trade(s) older than {retention_hours}h");
-                }
-                if let Err(e) = self.record_cleanup() {
-                    tracing::warn!("Failed to record last_cleanup timestamp: {e:#}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("Data cleanup failed: {e:#}");
-            }
-        }
-    }
-
-    /// Compute how long to sleep before the next cleanup is needed.
-    fn next_cleanup_delay(&self, retention_ms: i64) -> Duration {
-        let now_ms = Self::now_ms();
-
-        let anchor_ms = match self.last_cleanup_ms() {
-            Ok(Some(ts)) => ts,
-            Ok(None) => {
-                tracing::debug!("No last_cleanup recorded; anchoring at now");
-                now_ms
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read last_cleanup: {e:#}; retrying in 10 min");
-                return Duration::from_secs(600);
-            }
-        };
-
-        let next_ms = anchor_ms + retention_ms;
-        if next_ms <= now_ms {
-            Duration::ZERO
-        } else {
-            Duration::from_millis((next_ms - now_ms) as u64)
-        }
-    }
-
-    /// Spawn a background task that schedules the next cleanup pass based
-    /// on the `last_cleanup` metadata, without polling.
-    ///
-    /// After each cleanup pass (which writes `last_cleanup`), the task
-    /// computes `last_cleanup + retention_hours` and sleeps exactly until
-    /// that moment.  This means wakeups only happen when data is actually
-    /// due for expiry — there is no periodic polling.
-    ///
-    /// A startup [`run_cleanup`](Self::run_cleanup) is expected to have been
-    /// called by the caller before this task is spawned so that `last_cleanup`
-    /// is initialised.
-    pub fn spawn_periodic_cleanup(
-        &self,
-        retention_hours: u64,
-        shutdown: CancellationToken,
-    ) -> JoinHandle<()> {
-        let storage = self.clone();
-        tokio::spawn(async move {
-            let retention_ms = (retention_hours as i64) * 3_600_000;
-
-            loop {
-                let delay = storage.next_cleanup_delay(retention_ms);
-
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {
-                        tracing::info!("Periodic cleanup shut down.");
-                        break;
-                    }
-                    _ = tokio::time::sleep(delay) => {
-                        storage.run_cleanup(retention_hours);
-                    }
-                }
-            }
-        })
-    }
-
-    /// Return the current UTC timestamp in milliseconds since the Unix epoch.
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
+        self.set_metadata("last_cleanup", &now_ms.to_string())?;
+        Ok(now_ms)
     }
 
     /// Spawn a background task that receives trades on `rx`, buffers them,

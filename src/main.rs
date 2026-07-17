@@ -1,4 +1,5 @@
 mod api;
+mod cleanup;
 mod config;
 mod discovery;
 mod ingestion;
@@ -59,7 +60,7 @@ struct App {
     auth_token: Option<String>,
     flush_interval: std::time::Duration,
     max_buffered_trades: usize,
-    data_retention_hours: u64,
+    cleanup_scheduler: cleanup::CleanupScheduler,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
 }
 
@@ -72,7 +73,10 @@ impl App {
             std::process::exit(1);
         });
 
-        storage.run_cleanup(config.data_retention_hours);
+        let cleanup_config =
+            cleanup::CleanupConfig::from_config(config.data_retention_hours, config.max_storage_mb);
+
+        let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config);
 
         let whitelist = config.resolve_whitelist();
         if !config.discovery_mode && (whitelist.is_empty() || config.base_assets.is_empty()) {
@@ -198,8 +202,8 @@ impl App {
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             max_buffered_trades: config.max_buffered_trades,
-            data_retention_hours: config.data_retention_hours,
             tls_config,
+            cleanup_scheduler,
         }
     }
 
@@ -214,9 +218,7 @@ impl App {
             self.max_buffered_trades,
         );
 
-        let _cleanup = self
-            .storage
-            .spawn_periodic_cleanup(self.data_retention_hours, shutdown.child_token());
+        let _cleanup = self.cleanup_scheduler.spawn(shutdown.child_token());
 
         let ingest = ingestion::start_all_ingest_tasks(
             &self.resolved_pairs,
