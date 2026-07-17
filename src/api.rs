@@ -11,76 +11,51 @@ use axum::{
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use flowsurface_exchange::{TickerInfo, Trade};
+use flowsurface_exchange::{
+    Ticker, Trade,
+    adapter::{Exchange, MarketKind, Venue},
+};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{GroupedTrade, PairInfo, Storage};
-
-pub struct Server {
-    pub storage: Storage,
-    pub startup: Instant,
-    pub auth_token: Option<String>,
-    /// The set of (exchange, symbol) pairs configured at startup.
-    /// Used by `/pairs` to include pairs that have not yet received trades.
-    pub configured_pairs: Vec<(String, String)>,
-    /// All available ticker symbols per exchange, from the metadata cache.
-    /// Used by `/exchanges` to help users discover correct suffix patterns.
-    pub available_tickers: HashMap<String, Vec<String>>,
-    /// TLS configuration for the HTTPS server (self-signed).
-    /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
-    pub tls_config: Option<RustlsConfig>,
-}
+use crate::storage::{PairInfo, Storage};
 
 #[derive(Serialize)]
-struct StatusResponse {
-    status: &'static str,
-    uptime_secs: u64,
-    db_ok: bool,
-}
-
-#[derive(Serialize)]
-struct PairsResponse {
-    pairs: Vec<PairInfo>,
-    tracked_count: usize,
-}
-
-#[derive(Serialize)]
-struct TradesResponse {
-    trades: Vec<AnnotatedTrade>,
-}
-
-#[derive(Serialize)]
-struct GroupedTradesResponse {
-    trades: Vec<GroupedTrade>,
+#[serde(untagged)]
+enum Response {
+    Status {
+        status: &'static str,
+        uptime_secs: u64,
+        db_ok: bool,
+    },
+    Pairs {
+        pairs: Vec<PairInfo>,
+        tracked_count: usize,
+    },
+    Trades {
+        trades: Vec<AnnotatedTrade>,
+    },
+    Exchanges {
+        exchanges: HashMap<String, Vec<String>>,
+    },
 }
 
 /// A normalized trade record, used both in-memory and serialized to JSON.
 #[derive(Debug, Clone)]
 pub struct AnnotatedTrade {
-    pub exchange: String,
-    pub symbol: String,
+    pub ticker: Ticker,
     pub trade: Trade,
 }
 
 impl AnnotatedTrade {
-    pub fn new(ticker_info: TickerInfo, trade: Trade) -> Self {
-        let symbol = ticker_info.ticker.to_string().to_lowercase();
-        let exchange = ticker_info.exchange();
-
-        AnnotatedTrade {
-            exchange: exchange.to_string(),
-            symbol: symbol.clone(),
-            trade,
-        }
+    pub fn new(ticker: Ticker, trade: Trade) -> Self {
+        AnnotatedTrade { ticker, trade }
     }
 }
 
 impl Serialize for AnnotatedTrade {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Trade", 6)?;
-        s.serialize_field("exchange", &self.exchange)?;
-        s.serialize_field("symbol", &self.symbol)?;
+        let mut s = serializer.serialize_struct("Trade", 4)?;
         s.serialize_field("ts", &self.trade.time)?;
         s.serialize_field("price", &self.trade.price.to_f64())?;
         s.serialize_field("qty", &self.trade.qty.to_f64())?;
@@ -106,36 +81,42 @@ pub struct TradeQuery {
     pub limit: Option<usize>,
 }
 
-/// Query parameters for the GET /trades/grouped endpoint.
-#[derive(Debug, Deserialize)]
-pub struct GroupedTradeQuery {
-    /// Venue filter, e.g. "binance" (used with `market` to derive exchange).
-    venue: String,
-    /// Symbol filter.
-    symbol: String,
-    /// Market filter: "spot", "linear", or "inverse" (used with `venue`).
-    market: String,
-    /// Inclusive lower bound (milliseconds since epoch). Optional.
-    from: Option<i64>,
-    /// Inclusive upper bound (milliseconds since epoch). Optional.
-    to: Option<i64>,
-    /// Maximum number of records to return (default 1000, max 10_000).
-    limit: Option<usize>,
-    /// Integer multiplier applied to the exchange's minimum tick size
-    /// to produce the price bucket width (default 1).
-    step: Option<u16>,
+impl TradeQuery {
+    /// Derive an exchange filter string from a `TradeQuery`'s `venue` + `market`.
+    pub fn exchange_filter(self: &TradeQuery) -> String {
+        exchange_from_venue_market(&self.venue, &self.market)
+            .unwrap_or_else(|| format!("{}/{}", self.venue, self.market))
+    }
 }
 
-#[derive(Serialize)]
-struct ExchangesResponse {
-    exchanges: HashMap<String, Vec<String>>,
+/// Derive the canonical exchange string from raw `venue` + `market` strings.
+pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
+    let venue_enum: Venue = venue.parse().ok()?;
+    let market_enum: MarketKind = market.parse().ok()?;
+
+    Exchange::from_venue_and_market(venue_enum, market_enum).map(|ex| ex.to_string())
+}
+
+pub struct Server {
+    pub storage: Storage,
+    pub startup: Instant,
+    pub auth_token: Option<String>,
+    /// The tickers configured at startup.
+    /// Used by `/pairs` to include pairs that have not yet received trades.
+    pub configured_pairs: Vec<Ticker>,
+    /// All available ticker symbols per exchange, from the metadata cache.
+    /// Used by `/exchanges` to help users discover correct suffix patterns.
+    pub available_tickers: HashMap<String, Vec<String>>,
+    /// TLS configuration for the HTTPS server (self-signed).
+    /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
+    pub tls_config: Option<RustlsConfig>,
 }
 
 impl Server {
     pub fn new(
         storage: Storage,
         auth_token: Option<String>,
-        configured_pairs: Vec<(String, String)>,
+        configured_pairs: Vec<Ticker>,
         available_tickers: HashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
     ) -> Self {
@@ -207,7 +188,7 @@ impl Server {
         let uptime = state.startup.elapsed().as_secs();
         let db_ok = state.storage.pair_count().is_ok();
 
-        Self::json_ok(&StatusResponse {
+        Self::json_ok(&Response::Status {
             status: "ok",
             uptime_secs: uptime,
             db_ok,
@@ -220,7 +201,7 @@ impl Server {
     /// the exchange APIs at startup.  Useful for discovering the correct suffix
     /// patterns when configuring `config.toml`.
     async fn exchanges(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        Self::json_ok(&ExchangesResponse {
+        Self::json_ok(&Response::Exchanges {
             exchanges: state.available_tickers.clone(),
         })
     }
@@ -241,18 +222,24 @@ impl Server {
         let mut by_key: std::collections::HashMap<String, &PairInfo> =
             std::collections::HashMap::new();
         for p in &db_pairs {
-            by_key.insert(format!("{}:{}", p.exchange, p.symbol), p);
+            let ex_str = p.ticker.exchange.to_string();
+            let sym_str = p.ticker.to_string().to_lowercase();
+            by_key.insert(format!("{ex_str}:{sym_str}"), p);
         }
 
         // Merge: every configured pair gets a PairInfo; fill in DB bounds when available.
         let mut merged: Vec<PairInfo> = Vec::with_capacity(state.configured_pairs.len());
-        for (ex, sym) in &state.configured_pairs {
-            let key = format!("{ex}:{sym}");
+        for ticker in &state.configured_pairs {
+            let ex_str = ticker.exchange.to_string();
+            let sym_str = ticker
+                .display_symbol()
+                .map(|s| s.to_lowercase())
+                .unwrap_or_else(|| ticker.to_string().to_lowercase());
+            let key = format!("{ex_str}:{sym_str}");
             match by_key.get(&key) {
-                Some(found) => merged.push((*found).clone()),
+                Some(found) => merged.push(*(*found)),
                 None => merged.push(PairInfo {
-                    exchange: ex.clone(),
-                    symbol: sym.clone(),
+                    ticker: *ticker,
                     earliest: None,
                     latest: None,
                 }),
@@ -260,7 +247,7 @@ impl Server {
         }
 
         let count = merged.len();
-        Self::json_ok(&PairsResponse {
+        Self::json_ok(&Response::Pairs {
             pairs: merged,
             tracked_count: count,
         })
@@ -269,79 +256,56 @@ impl Server {
     /// GET /trades
     async fn trades(State(state): State<Arc<Self>>, query: Query<TradeQuery>) -> impl IntoResponse {
         match state.storage.query_trades(&query) {
-            Ok(trades) => Self::json_ok(&TradesResponse { trades }),
+            Ok(trades) => Self::json_ok(&Response::Trades { trades }),
             Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     }
 
-    /// GET /trades/grouped
-    async fn grouped_trades(
+    /// GET /trades.arrow
+    ///
+    /// Returns trades as an **Arrow IPC stream**, exported directly from
+    /// DuckDB via Arrow export.
+    ///
+    /// The Arrow IPC streaming format uses 4 columns:
+    /// `ts (int64)`, `price (float64)`,
+    /// `qty (float64)`, `is_sell (bool)`.
+    ///
+    /// This endpoint uses parameterised queries internally (safe from SQL
+    /// injection).
+    async fn trades_arrow(
         State(state): State<Arc<Self>>,
-        query: Query<GroupedTradeQuery>,
-    ) -> impl IntoResponse {
-        // Derive the canonical exchange string from venue + market.
-        let ex_str = match Storage::exchange_from_venue_market(&query.venue, &query.market) {
-            Some(ex) => ex,
-            None => {
-                return Self::json_err(
-                    StatusCode::BAD_REQUEST,
-                    "could not determine exchange from venue/market",
-                );
-            }
-        };
+        query: Query<TradeQuery>,
+    ) -> axum::response::Response {
+        let limit = query.limit.unwrap_or(100_000).min(1_000_000);
 
-        // Look up ticker metadata to get the tick size.
-        let info = match state.storage.get_ticker_info(&ex_str, &query.symbol) {
-            Ok(Some(info)) => info,
-            Ok(None) => {
-                return Self::json_err(
-                    StatusCode::NOT_FOUND,
-                    &format!("no ticker metadata for {}/{}", ex_str, query.symbol),
-                );
-            }
+        let mut bounded = query.0;
+        bounded.limit = Some(limit);
+
+        let arrow_bytes = match state.storage.query_trades_arrow_ipc(&bounded) {
+            Ok(bytes) => bytes,
             Err(e) => {
-                return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+                return Server::json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("arrow export: {e:#}"),
+                );
             }
         };
 
-        // Compute the bucket width: min_ticksize × step multiplier.
-        // `step` is an integer (e.g. 1, 2, 5, 50) — never a raw decimal.
-        let multiplier = query.step.unwrap_or(1).max(1) as f64;
-        let step_size = 10.0_f64.powi(info.min_ticksize as i32) * multiplier;
-
-        // Derive price precision from min_ticksize (e.g. power -1 → 1 decimal place).
-        let price_precision = if info.min_ticksize < 0 {
-            -info.min_ticksize as u32
-        } else {
-            0
-        };
-
-        // Derive quantity precision from min_qty (e.g. power -3 → 3 decimal places).
-        let qty_precision = if info.min_qty < 0 {
-            -info.min_qty as u32
-        } else {
-            0
-        };
-
-        // Reuse the same filter params as a regular TradeQuery.
-        let trade_query = TradeQuery {
-            venue: query.venue.clone(),
-            symbol: query.symbol.clone(),
-            market: query.market.clone(),
-            from: query.from,
-            to: query.to,
-            limit: query.limit,
-        };
-
-        match state.storage.query_grouped_trades(
-            &trade_query,
-            step_size,
-            price_precision,
-            qty_precision,
-        ) {
-            Ok(trades) => Self::json_ok(&GroupedTradesResponse { trades }),
-            Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        }
+        (
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.apache.arrow.stream",
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"trades.arrow\"",
+                ),
+            ],
+            arrow_bytes,
+        )
+            .into_response()
     }
 
     /// Bind to `bind_address` and spawn the axum HTTP(S) server.
@@ -366,7 +330,7 @@ impl Server {
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
-            .route("/trades/grouped", get(Server::grouped_trades))
+            .route("/trades.arrow", get(Server::trades_arrow))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),
                 auth_middleware,

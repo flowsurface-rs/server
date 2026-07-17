@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use flowsurface_exchange::TickerInfo;
 use flowsurface_exchange::adapter::{AdapterHandles, Venue};
+use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
 use crate::config::{Args, Config};
@@ -123,21 +123,8 @@ impl App {
         );
 
         // Persist ticker metadata for the API layer.
-        {
-            let records = resolved_pairs
-                .iter()
-                .map(|ti| storage::TickerInfoRecord {
-                    exchange: ti.exchange().to_string(),
-                    symbol: ti.ticker.to_string().to_lowercase(),
-                    min_ticksize: ti.min_ticksize.power,
-                    min_qty: ti.min_qty.power,
-                    contract_size: ti.contract_size.map(|cs| cs.power),
-                })
-                .collect::<Vec<_>>();
-
-            if let Err(e) = storage.store_ticker_infos(&records) {
-                tracing::warn!("Failed to persist ticker metadata: {e:#}");
-            }
+        if let Err(e) = storage.store_ticker_infos(&resolved_pairs) {
+            tracing::warn!("Failed to persist ticker metadata: {e:#}");
         }
 
         // Only generate TLS cert for non-loopback addresses.
@@ -239,16 +226,8 @@ impl App {
         )
         .await;
 
-        let configured_pairs: Vec<(String, String)> = self
-            .resolved_pairs
-            .iter()
-            .map(|ti| {
-                (
-                    ti.exchange().to_string(),
-                    ti.ticker.to_string().to_lowercase(),
-                )
-            })
-            .collect();
+        let configured_pairs: Vec<Ticker> =
+            self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
 
         let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
         let server = Arc::new(Server::new(

@@ -25,6 +25,9 @@ flowsurface-exchange = "0.8.9"
 # Storage
 duckdb = { version = "1.10504", features = ["bundled"] }
 
+# Arrow IPC (zero-copy columnar transport)
+arrow = { version = "58", default-features = false, features = ["ipc"] }
+
 # Serialization
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }

@@ -1,47 +1,22 @@
 use anyhow::{Context, Result};
 use duckdb::{Appender, Connection};
-use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flowsurface_exchange::UnixMs;
-use flowsurface_exchange::unit::price::Price;
-use flowsurface_exchange::unit::qty::Qty;
+use flowsurface_exchange::adapter::Exchange;
+use flowsurface_exchange::unit::{price::Price, qty::Qty};
+use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
 use crate::api::{AnnotatedTrade, TradeQuery};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// A trade aggregated to a price level (tick-aligned bucket).
-#[derive(Debug, Clone, Serialize)]
-pub struct GroupedTrade {
-    pub price_level: f64,
-    pub buy_volume: f64,
-    pub sell_volume: f64,
-    pub buy_count: i64,
-    pub sell_count: i64,
-    pub first_ts: i64,
-    pub last_ts: i64,
-}
-
-/// A record stored in the `ticker_info` table, mirroring
-/// `flowsurface_exchange::TickerInfo`'s tick-size / min-qty data.
-#[derive(Debug, Clone)]
-pub struct TickerInfoRecord {
-    pub exchange: String,
-    pub symbol: String,
-    pub min_ticksize: i8,
-    pub min_qty: i8,
-    pub contract_size: Option<i8>,
-}
-
 /// Information about a tracked pair with the timestamp range stored.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PairInfo {
-    pub exchange: String,
-    pub symbol: String,
+    pub ticker: Ticker,
     pub earliest: Option<UnixMs>,
     pub latest: Option<UnixMs>,
 }
@@ -134,28 +109,12 @@ impl Storage {
             .context("cloning root connection for query")
     }
 
-    // ── queries ──────────────────────────────────────────────────────
-
-    /// Derive the canonical exchange string from raw `venue` + `market` strings.
-    pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
-        let venue_enum: flowsurface_exchange::adapter::Venue = venue.parse().ok()?;
-        let market_enum: flowsurface_exchange::adapter::MarketKind = market.parse().ok()?;
-        flowsurface_exchange::adapter::Exchange::from_venue_and_market(venue_enum, market_enum)
-            .map(|ex| ex.to_string())
-    }
-
-    /// Derive an exchange filter string from a `TradeQuery`'s `venue` + `market`.
-    fn exchange_filter(q: &TradeQuery) -> String {
-        Self::exchange_from_venue_market(&q.venue, &q.market)
-            .unwrap_or_else(|| format!("{}/{}", q.venue, q.market))
-    }
-
     /// Query trades matching the given filter.
     pub fn query_trades(&self, q: &TradeQuery) -> Result<Vec<AnnotatedTrade>> {
         let conn = self.connection()?;
 
         let limit = q.limit.unwrap_or(1000).min(10_000);
-        let exchange = Self::exchange_filter(q);
+        let exchange = q.exchange_filter();
 
         // Build the SQL with positional ? placeholders.
         let mut sql = String::from(
@@ -172,12 +131,17 @@ impl Storage {
             sql.push_str(" AND ts <= ?");
         }
 
-        sql.push_str(" ORDER BY ts ASC");
+        if q.from.is_some() {
+            sql.push_str(" ORDER BY ts ASC");
+        } else {
+            sql.push_str(" ORDER BY ts DESC");
+        }
         sql.push_str(&format!(" LIMIT {}", limit));
 
         let mut stmt = conn.prepare(&sql).context("preparing trade query")?;
 
-        let mut params: Vec<&dyn duckdb::ToSql> = vec![&q.symbol, &exchange];
+        let symbol_lower = q.symbol.to_lowercase();
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![&symbol_lower, &exchange];
         if let Some(ref from) = q.from {
             params.push(from);
         }
@@ -185,31 +149,115 @@ impl Storage {
             params.push(to);
         }
 
-        let rows = stmt.query_map(&params[..], |row| {
-            Ok(AnnotatedTrade {
-                exchange: row.get(0)?,
-                symbol: row.get(1)?,
+        let mut rows = stmt.query(&params[..]).context("querying trades")?;
+
+        let mut trades = Vec::new();
+        while let Some(row) = rows.next()? {
+            let exchange_str: String = row.get(0)?;
+            let symbol_str: String = row.get(1)?;
+            let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
+                anyhow::anyhow!("cannot parse exchange '{exchange_str}': {e}")
+            })?;
+
+            trades.push(AnnotatedTrade {
+                ticker: Ticker::new(&symbol_str, exchange),
                 trade: flowsurface_exchange::Trade {
                     time: UnixMs::new(row.get::<_, i64>(2)? as u64),
                     is_sell: row.get(5)?,
                     price: Price::from_f64(row.get::<_, f64>(3)?),
                     qty: Qty::from_f64(row.get::<_, f64>(4)?),
                 },
-            })
-        })?;
-
-        let mut trades = Vec::new();
-        for row in rows {
-            trades.push(row?);
+            });
         }
         Ok(trades)
     }
 
-    // ── ticker metadata ──────────────────────────────────────────────
+    /// Export matching trades as an **Arrow IPC stream**.
+    ///
+    /// Returns the complete Arrow IPC streaming format payload suitable
+    /// for HTTP response with `Content-Type: application/vnd.apache.arrow.stream`.
+    pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
+        let conn = self.connection()?;
+
+        let limit = q.limit.unwrap_or(100_000).min(1_000_000);
+        let exchange = q.exchange_filter();
+        let symbol_lower = q.symbol.to_lowercase();
+
+        let mut sql = String::from(
+            "SELECT ts, price, qty, is_sell FROM trades \
+             WHERE symbol = ? AND exchange = ?",
+        );
+
+        if q.from.is_some() {
+            sql.push_str(" AND ts >= ?");
+        }
+        if q.to.is_some() {
+            sql.push_str(" AND ts <= ?");
+        }
+
+        if q.from.is_some() {
+            sql.push_str(" ORDER BY ts ASC");
+        } else {
+            sql.push_str(" ORDER BY ts DESC");
+        }
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![&symbol_lower, &exchange];
+        if let Some(ref from) = q.from {
+            params.push(from);
+        }
+        if let Some(ref to) = q.to {
+            params.push(to);
+        }
+
+        let mut stmt = conn.prepare(&sql).context("preparing Arrow IPC query")?;
+
+        let batches: Vec<arrow::record_batch::RecordBatch> = stmt
+            .query_arrow(&params[..])
+            .context("executing Arrow query")?
+            .collect();
+
+        // Drop the statement so the connection is free for the IPC writer.
+        drop(stmt);
+
+        let mut buf = Vec::new();
+        {
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use std::sync::Arc;
+
+            let schema: Arc<Schema> = if batches.is_empty() {
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, false),
+                    Field::new("price", DataType::Float64, false),
+                    Field::new("qty", DataType::Float64, false),
+                    Field::new("is_sell", DataType::Boolean, false),
+                ]))
+            } else {
+                batches[0].schema()
+            };
+
+            let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
+                .context("creating Arrow IPC stream writer")?;
+
+            for batch in &batches {
+                writer.write(batch).context("writing Arrow record batch")?;
+            }
+
+            writer.finish().context("finishing Arrow IPC stream")?;
+        }
+
+        tracing::debug!(
+            "Exported {} bytes of Arrow IPC data ({} batch(es))",
+            buf.len(),
+            batches.len()
+        );
+        Ok(buf)
+    }
 
     /// Persist ticker metadata for every resolved pair so the API can
     /// look up tick sizes at query time.
-    pub fn store_ticker_infos(&self, infos: &[TickerInfoRecord]) -> Result<()> {
+    pub fn store_ticker_infos(&self, infos: &[TickerInfo]) -> Result<()> {
         let conn = self.connection()?;
 
         let mut stmt = conn
@@ -222,149 +270,24 @@ impl Storage {
 
         for info in infos {
             stmt.execute(duckdb::params![
-                info.exchange,
-                info.symbol,
-                info.min_ticksize,
-                info.min_qty,
-                info.contract_size,
+                info.exchange().to_string(),
+                info.ticker
+                    .display_symbol()
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_else(|| info.ticker.to_string().to_lowercase()),
+                info.min_ticksize.power,
+                info.min_qty.power,
+                info.contract_size.map(|cs| cs.power),
             ])
             .with_context(|| {
                 format!(
                     "inserting ticker_info for {}/{}",
-                    info.exchange, info.symbol
+                    info.exchange(),
+                    info.ticker
                 )
             })?;
         }
         Ok(())
-    }
-
-    /// Look up the stored ticker metadata for an exchange + symbol.
-    pub fn get_ticker_info(
-        &self,
-        exchange: &str,
-        symbol: &str,
-    ) -> Result<Option<TickerInfoRecord>> {
-        let conn = self.connection()?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT exchange, symbol, min_ticksize, min_qty, contract_size
-                 FROM ticker_info
-                 WHERE exchange = ? AND symbol = ?",
-            )
-            .context("preparing ticker_info lookup")?;
-
-        let mut rows = stmt.query_map(duckdb::params![exchange, symbol], |row| {
-            Ok(TickerInfoRecord {
-                exchange: row.get(0)?,
-                symbol: row.get(1)?,
-                min_ticksize: row.get(2)?,
-                min_qty: row.get(3)?,
-                contract_size: row.get(4)?,
-            })
-        })?;
-
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
-        }
-    }
-
-    // ── grouped query ────────────────────────────────────────────────
-
-    /// Query trades aggregated by price level (tick-aligned buckets).
-    ///
-    /// `step_size` is the bucket width in price units (e.g. `0.01` for a
-    /// 1-tick group of a USDT pair with tick size 0.01).  The caller is
-    /// responsible for deriving this from `TickerInfo.min_ticksize` and
-    /// any desired step multiplier.
-    ///
-    /// `price_precision` is the number of decimal places to round the
-    /// resulting `price_level` to, derived from `TickerInfo.min_ticksize`
-    /// (e.g. `1` for a tick size of `0.1`).  This prevents floating-point
-    /// noise in the bucket label.
-    ///
-    /// `qty_precision` is the number of decimal places to round volume
-    /// aggregates to, derived from `TickerInfo.min_qty` (e.g. `3` for a
-    /// pair whose minimum qty step is `0.001`).  This eliminates the
-    /// floating-point noise that accumulates when summing f64 quantities.
-    pub fn query_grouped_trades(
-        &self,
-        q: &TradeQuery,
-        step_size: f64,
-        price_precision: u32,
-        qty_precision: u32,
-    ) -> Result<Vec<GroupedTrade>> {
-        let conn = self.connection()?;
-
-        let limit = q.limit.unwrap_or(1000).min(10_000);
-        let exchange = Self::exchange_filter(q);
-
-        let mut sql = String::from(
-            "SELECT
-                ROUND(FLOOR(price / ?) * ?, ?) AS price_level,
-                ROUND(COALESCE(SUM(CASE WHEN NOT is_sell THEN qty ELSE 0 END), 0.0), ?) AS buy_volume,
-                ROUND(COALESCE(SUM(CASE WHEN is_sell THEN qty ELSE 0 END), 0.0), ?)     AS sell_volume,
-                SUM(CASE WHEN NOT is_sell THEN 1 ELSE 0 END) AS buy_count,
-                SUM(CASE WHEN is_sell THEN 1 ELSE 0 END)     AS sell_count,
-                MIN(ts)                        AS first_ts,
-                MAX(ts)                        AS last_ts
-             FROM trades
-             WHERE symbol = ?
-             AND exchange = ?",
-        );
-
-        if q.from.is_some() {
-            sql.push_str(" AND ts >= ?");
-        }
-        if q.to.is_some() {
-            sql.push_str(" AND ts <= ?");
-        }
-
-        sql.push_str(" GROUP BY price_level ORDER BY last_ts DESC, price_level ASC");
-        sql.push_str(&format!(" LIMIT {}", limit));
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .context("preparing grouped trade query")?;
-
-        let step = step_size;
-        let price_prec = price_precision as i32;
-        let qty_prec = qty_precision as i32;
-        let mut params: Vec<&dyn duckdb::ToSql> = vec![
-            &step,
-            &step,
-            &price_prec,
-            &qty_prec,
-            &qty_prec,
-            &q.symbol,
-            &exchange,
-        ];
-        if let Some(ref from) = q.from {
-            params.push(from);
-        }
-        if let Some(ref to) = q.to {
-            params.push(to);
-        }
-
-        let rows = stmt.query_map(&params[..], |row| {
-            Ok(GroupedTrade {
-                price_level: row.get(0)?,
-                buy_volume: row.get(1)?,
-                sell_volume: row.get(2)?,
-                buy_count: row.get(3)?,
-                sell_count: row.get(4)?,
-                first_ts: row.get(5)?,
-                last_ts: row.get(6)?,
-            })
-        })?;
-
-        let mut trades = Vec::new();
-        for row in rows {
-            trades.push(row?);
-        }
-        Ok(trades)
     }
 
     /// Return every (venue, symbol) that has at least one stored trade,
@@ -382,9 +305,17 @@ impl Storage {
         )?;
 
         let rows = stmt.query_map([], |row| {
+            let exchange_str: String = row.get(0)?;
+            let symbol_str: String = row.get(1)?;
+            let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
+                duckdb::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cannot parse exchange '{exchange_str}': {e}"),
+                )))
+            })?;
+
             Ok(PairInfo {
-                exchange: row.get(0)?,
-                symbol: row.get(1)?,
+                ticker: Ticker::new(&symbol_str, exchange),
                 earliest: row.get::<_, Option<i64>>(2)?.map(|v| UnixMs::new(v as u64)),
                 latest: row.get::<_, Option<i64>>(3)?.map(|v| UnixMs::new(v as u64)),
             })
@@ -437,7 +368,7 @@ impl Storage {
     /// older than `retention_hours`.  Returns the number of deleted rows.
     pub fn purge_old_trades(&self, retention_hours: u64) -> Result<u64> {
         let conn = self.connection()?;
-        let cutoff_ms = chrono_now_ms() - (retention_hours as i64 * 3_600_000);
+        let cutoff_ms = Self::now_ms() - (retention_hours as i64 * 3_600_000);
         let deleted = conn
             .execute(
                 "DELETE FROM trades WHERE ts < ?1",
@@ -455,9 +386,8 @@ impl Storage {
             .transpose()
     }
 
-    /// Record that cleanup ran just now.
     pub fn record_cleanup(&self) -> Result<()> {
-        let now_ms = chrono_now_ms();
+        let now_ms = Self::now_ms();
         self.set_metadata("last_cleanup", &now_ms.to_string())
     }
 
@@ -483,7 +413,7 @@ impl Storage {
 
     /// Compute how long to sleep before the next cleanup is needed.
     fn next_cleanup_delay(&self, retention_ms: i64) -> Duration {
-        let now_ms = chrono_now_ms();
+        let now_ms = Self::now_ms();
 
         let anchor_ms = match self.last_cleanup_ms() {
             Ok(Some(ts)) => ts,
@@ -542,6 +472,14 @@ impl Storage {
         })
     }
 
+    /// Return the current UTC timestamp in milliseconds since the Unix epoch.
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
     /// Spawn a background task that receives trades on `rx`, buffers them,
     /// and flushes to DuckDB via the Appender API every `flush_interval`.
     ///
@@ -567,39 +505,27 @@ impl Storage {
         flush_interval: Duration,
         max_buffered_trades: usize,
     ) -> JoinHandle<()> {
-        let storage = self.clone();
+        let store = self.clone();
 
         tokio::spawn(async move {
-            let mut buffer: Vec<AnnotatedTrade> = Vec::new();
-            let mut over_capacity_warned = false;
-
-            // Track an in-flight blocking flush so we don't pile multiple
-            // flushes on the blocking thread pool.
+            let mut buf = TradeBuffer::new(max_buffered_trades);
             let mut flush_handle: Option<JoinHandle<anyhow::Result<()>>> = None;
-
             let mut interval = tokio::time::interval(flush_interval);
             interval.reset_immediately();
 
             loop {
+                // Check if an in-flight blocking flush has finished.
                 if let Some(ref h) = flush_handle
                     && h.is_finished()
                 {
                     let handle = flush_handle.take().unwrap();
                     match handle.await {
-                        Ok(Ok(())) => {
-                            if over_capacity_warned {
-                                tracing::info!(
-                                    "Trade buffer flushed; back within capacity \
-                                         (max {max_buffered_trades})."
-                                );
-                                over_capacity_warned = false;
-                            }
-                        }
+                        Ok(Ok(())) => buf.flush_succeeded(),
                         Ok(Err(e)) => {
                             tracing::error!(
                                 "Batch flush failed ({} trades in new buffer, \
                                  failed batch dropped): {e:#}",
-                                buffer.len()
+                                buf.len()
                             );
                         }
                         Err(_) => {
@@ -611,64 +537,38 @@ impl Storage {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
-                        // Non-blocking drain: grab everything queued since the
-                        // last tick.  Must drain unconditionally to prevent the
-                        // unbounded channel's own internal buffer from growing
-                        // unchecked — but only buffer up to the cap.
+                        // Non-blocking drain of everything the channel has
+                        // queued since the last tick.
                         while let Ok(trade) = rx.try_recv() {
-                            if buffer.len() < max_buffered_trades {
-                                buffer.push(trade);
-                            } else if !over_capacity_warned {
-                                tracing::warn!(
-                                    "Trade buffer exceeded {max_buffered_trades} — \
-                                     dropping trades to protect against OOM. \
-                                     This warning is rate-limited."
-                                );
-                                over_capacity_warned = true;
-                            }
+                            buf.push(trade);
                         }
 
-                        // Spawn a blocking flush if we have data and none is
-                        // currently in-flight on the blocking thread pool.
-                        if !buffer.is_empty() && flush_handle.is_none() {
-                            let batch = std::mem::take(&mut buffer);
-                            let storage2 = storage.clone();
-                            flush_handle = Some(tokio::spawn(async move {
-                                tokio::task::spawn_blocking(move || {
-                                    let mut writer = storage2.open_writer()?;
-                                    writer.flush(&batch)
-                                })
-                                .await
-                                .context("blocking flush panicked")?
+                        // Start a blocking flush if we have data and none
+                        // is currently in-flight.
+                        if !buf.is_empty() && flush_handle.is_none() {
+                            let batch = buf.take();
+                            let store = store.clone();
+                            flush_handle = Some(tokio::task::spawn_blocking(move || {
+                                let mut writer = store.open_writer()?;
+                                writer.flush(&batch)
                             }));
                         }
                     }
                     maybe = rx.recv() => {
                         match maybe {
-                            Some(trade) => {
-                                if buffer.len() < max_buffered_trades {
-                                    buffer.push(trade);
-                                } else if !over_capacity_warned {
-                                    tracing::warn!(
-                                        "Trade buffer exceeded {max_buffered_trades} — \
-                                         dropping trades to protect against OOM. \
-                                         This warning is rate-limited."
-                                    );
-                                    over_capacity_warned = true;
-                                }
-                            }
+                            Some(trade) => buf.push(trade),
                             None => {
                                 // Channel closed: wait for in-flight flush,
-                                // then flush whatever is left in our buffer
-                                // in one last blocking call.
+                                // then flush whatever remains in the buffer.
                                 if let Some(handle) = flush_handle.take() && let Err(e) = handle.await {
                                     tracing::error!("Final flush task failed: {e:#}");
                                 }
-                                if !buffer.is_empty() {
-                                    let storage2 = storage.clone();
+                                if !buf.is_empty() {
+                                    let batch = buf.take();
+                                    let store = store.clone();
                                     if let Err(e) = tokio::task::spawn_blocking(move || {
-                                        let mut writer = storage2.open_writer()?;
-                                        writer.flush(&buffer)
+                                        let mut writer = store.open_writer()?;
+                                        writer.flush(&batch)
                                     })
                                     .await
                                     {
@@ -686,15 +586,6 @@ impl Storage {
     }
 }
 
-/// Millisecond timestamp suitable for retention calculations (UTC-based,
-/// monotonic-adjacent — uses `std::time::SystemTime`).
-fn chrono_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 /// Writes trades to DuckDB using the `Appender` API, with in-memory
 /// buffering so that flushes happen in bulk.
 pub struct BatchWriter {
@@ -703,8 +594,6 @@ pub struct BatchWriter {
 
 impl BatchWriter {
     /// Flush a batch of trades to the database using the DuckDB Appender.
-    /// The Appender is created fresh for each flush so we don't fight
-    /// Rust's borrow checker (Appender borrows Connection).
     pub fn flush(&mut self, trades: &[AnnotatedTrade]) -> Result<()> {
         if trades.is_empty() {
             return Ok(());
@@ -718,8 +607,11 @@ impl BatchWriter {
         for t in trades {
             appender
                 .append_row((
-                    &t.exchange,
-                    &t.symbol,
+                    &t.ticker.exchange.to_string(),
+                    &t.ticker
+                        .display_symbol()
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_else(|| t.ticker.to_string().to_lowercase()),
                     t.trade.time.as_u64() as i64,
                     t.trade.price.to_f64(),
                     t.trade.qty.to_f64(),
@@ -729,7 +621,65 @@ impl BatchWriter {
         }
 
         appender.flush().context("flushing DuckDB appender")?;
-        // Appender drops here, implicitly committing.
         Ok(())
+    }
+}
+
+/// A cap-limited trade buffer with overflow warnings.
+///
+/// Drops incoming trades when the buffer exceeds `max` and emits a
+/// rate-limited warning.  The warning is automatically cleared on the
+/// next successful flush.
+struct TradeBuffer {
+    trades: Vec<AnnotatedTrade>,
+    max: usize,
+    warned: bool,
+}
+
+impl TradeBuffer {
+    fn new(max: usize) -> Self {
+        Self {
+            trades: Vec::new(),
+            max,
+            warned: false,
+        }
+    }
+
+    /// Try to append a trade, dropping it if the buffer is full.
+    fn push(&mut self, trade: AnnotatedTrade) {
+        if self.trades.len() < self.max {
+            self.trades.push(trade);
+        } else if !self.warned {
+            tracing::warn!(
+                "Trade buffer exceeded {} — dropping trades to protect against OOM. \
+                 This warning is rate-limited.",
+                self.max
+            );
+            self.warned = true;
+        }
+    }
+
+    /// Clear the over-capacity warning (call after a successful flush).
+    fn flush_succeeded(&mut self) {
+        if self.warned {
+            tracing::info!(
+                "Trade buffer flushed; back within capacity (max {}).",
+                self.max
+            );
+            self.warned = false;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.trades.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.trades.is_empty()
+    }
+
+    /// Drain the buffer, returning all accumulated trades.
+    fn take(&mut self) -> Vec<AnnotatedTrade> {
+        std::mem::take(&mut self.trades)
     }
 }
