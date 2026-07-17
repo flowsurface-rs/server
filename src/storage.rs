@@ -1,42 +1,17 @@
 use anyhow::{Context, Result};
 use duckdb::{Appender, Connection};
-use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use flowsurface_exchange::adapter::Exchange;
-use flowsurface_exchange::unit::{ContractSize, MinQtySize, MinTicksize, price::Price, qty::Qty};
+use flowsurface_exchange::unit::{price::Price, qty::Qty};
 use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
 use crate::api::{AnnotatedTrade, TradeQuery};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-/// A trade aggregated to a price level (tick-aligned bucket).
-#[derive(Debug, Clone, Serialize)]
-pub struct GroupedTrade {
-    pub price_level: f64,
-    pub buy_volume: f64,
-    pub sell_volume: f64,
-    pub buy_count: i64,
-    pub sell_count: i64,
-    pub first_ts: i64,
-    pub last_ts: i64,
-}
-
-/// A time bucket containing price-level trade aggregations (footprint chart).
-///
-/// Returned by [`Storage::query_grouped_trades`].  Each bucket spans
-/// `[bucket_start, bucket_end)` milliseconds and holds one [`GroupedTrade`]
-/// per price level that traded within that window.
-#[derive(Debug, Clone, Serialize)]
-pub struct GroupedBucket {
-    pub bucket_start: i64,
-    pub bucket_end: i64,
-    pub price_levels: Vec<GroupedTrade>,
-}
 
 /// Information about a tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -294,169 +269,6 @@ impl Storage {
             })?;
         }
         Ok(())
-    }
-
-    /// Look up the stored ticker metadata for an exchange + symbol.
-    pub fn get_ticker_info(&self, exchange: &str, symbol: &str) -> Result<Option<TickerInfo>> {
-        let conn = self.connection()?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT exchange, symbol, min_ticksize, min_qty, contract_size
-                 FROM ticker_info
-                 WHERE exchange = ? AND symbol = ?",
-            )
-            .context("preparing ticker_info lookup")?;
-
-        let symbol_lower = symbol.to_lowercase();
-        let mut rows = stmt
-            .query(duckdb::params![exchange, symbol_lower])
-            .context("querying ticker_info")?;
-
-        match rows.next().context("iterating ticker_info rows")? {
-            Some(row) => {
-                let exchange_str: String = row.get(0)?;
-                let symbol_str: String = row.get(1)?;
-                let min_ticksize_power: i8 = row.get(2)?;
-                let min_qty_power: i8 = row.get(3)?;
-                let contract_size_power: Option<i8> = row.get(4)?;
-
-                let exchange: Exchange = exchange_str.parse().map_err(|e: String| {
-                    anyhow::anyhow!("cannot parse exchange '{exchange_str}': {e}")
-                })?;
-
-                Ok(Some(TickerInfo {
-                    ticker: Ticker::new(&symbol_str, exchange),
-                    min_ticksize: MinTicksize::new(min_ticksize_power),
-                    min_qty: MinQtySize::new(min_qty_power),
-                    contract_size: contract_size_power.map(ContractSize::new),
-                }))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Query trades as footprint-chart buckets (time × price-level aggregation).
-    ///
-    /// Returns up to `limit` consecutive time buckets starting at `q.from`,
-    /// each `bucket_ms` wide.  Within every bucket, trades are further grouped
-    /// by price level (tick-aligned using `step_size`).
-    ///
-    /// `q.from` **must** be set — the caller is responsible for resolving
-    /// time bounds before calling this function.
-    pub fn query_grouped_trades(
-        &self,
-        q: &TradeQuery,
-        bucket_ms: i64,
-        step_size: f64,
-        price_precision: u32,
-        qty_precision: u32,
-    ) -> Result<Vec<GroupedBucket>> {
-        let conn = self.connection()?;
-
-        let limit = q.limit.unwrap_or(100).min(500) as i64;
-        let exchange = q.exchange_filter();
-
-        // `from` is required; the handler should always resolve it.
-        let from = q.from.expect("query_grouped_trades requires q.from");
-        let to = from + bucket_ms * limit;
-
-        let mut sql = String::from(
-            "SELECT
-                FLOOR(ts / ?) * ?                 AS bucket_start,
-                ROUND(FLOOR(price / ?) * ?, ?)   AS price_level,
-                ROUND(COALESCE(SUM(CASE WHEN NOT is_sell THEN qty ELSE 0 END), 0.0), ?) AS buy_volume,
-                ROUND(COALESCE(SUM(CASE WHEN is_sell THEN qty ELSE 0 END), 0.0), ?)     AS sell_volume,
-                SUM(CASE WHEN NOT is_sell THEN 1 ELSE 0 END) AS buy_count,
-                SUM(CASE WHEN is_sell THEN 1 ELSE 0 END)     AS sell_count,
-                MIN(ts)                        AS first_ts,
-                MAX(ts)                        AS last_ts
-             FROM trades
-             WHERE symbol = ?
-             AND exchange = ?
-             AND ts >= ?
-             AND ts < ?",
-        );
-
-        sql.push_str(" GROUP BY bucket_start, price_level");
-        sql.push_str(" ORDER BY bucket_start ASC, price_level ASC");
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .context("preparing footprint trade query")?;
-
-        let bucket = bucket_ms;
-        let step = step_size;
-        let price_prec = price_precision as i32;
-        let qty_prec = qty_precision as i32;
-        let symbol_lower = q.symbol.to_lowercase();
-
-        let rows = stmt.query_map(
-            duckdb::params![
-                bucket,
-                bucket, // FLOOR(ts / bucket) * bucket
-                step,
-                step,
-                price_prec, // price bucket + precision
-                qty_prec,
-                qty_prec, // qty precision (used twice)
-                symbol_lower,
-                exchange,
-                from,
-                to,
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?, // bucket_start
-                    GroupedTrade {
-                        price_level: row.get(1)?,
-                        buy_volume: row.get(2)?,
-                        sell_volume: row.get(3)?,
-                        buy_count: row.get(4)?,
-                        sell_count: row.get(5)?,
-                        first_ts: row.get(6)?,
-                        last_ts: row.get(7)?,
-                    },
-                ))
-            },
-        )?;
-
-        // Group flat rows by bucket_start into GroupedBucket values.
-        let mut buckets: Vec<GroupedBucket> = Vec::new();
-        let mut current_start: Option<i64> = None;
-        let mut current_levels: Vec<GroupedTrade> = Vec::new();
-
-        for row in rows {
-            let (bucket_start, trade) = row?;
-            match current_start {
-                Some(start) if start == bucket_start => {
-                    current_levels.push(trade);
-                }
-                Some(start) => {
-                    buckets.push(GroupedBucket {
-                        bucket_start: start,
-                        bucket_end: start + bucket_ms,
-                        price_levels: std::mem::take(&mut current_levels),
-                    });
-                    current_start = Some(bucket_start);
-                    current_levels.push(trade);
-                }
-                None => {
-                    current_start = Some(bucket_start);
-                    current_levels.push(trade);
-                }
-            }
-        }
-        // Flush the last bucket.
-        if let Some(start) = current_start {
-            buckets.push(GroupedBucket {
-                bucket_start: start,
-                bucket_end: start + bucket_ms,
-                price_levels: current_levels,
-            });
-        }
-
-        Ok(buckets)
     }
 
     /// Return every (venue, symbol) that has at least one stored trade,

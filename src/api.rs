@@ -12,12 +12,12 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use flowsurface_exchange::{
-    Ticker, Timeframe, Trade,
+    Ticker, Trade,
     adapter::{Exchange, MarketKind, Venue},
 };
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{GroupedBucket, PairInfo, Storage};
+use crate::storage::{PairInfo, Storage};
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -33,9 +33,6 @@ enum Response {
     },
     Trades {
         trades: Vec<AnnotatedTrade>,
-    },
-    GroupedTrades {
-        buckets: Vec<GroupedBucket>,
     },
     Exchanges {
         exchanges: HashMap<String, Vec<String>>,
@@ -98,31 +95,6 @@ pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
     let market_enum: MarketKind = market.parse().ok()?;
 
     Exchange::from_venue_and_market(venue_enum, market_enum).map(|ex| ex.to_string())
-}
-
-/// Query parameters for the GET /trades/grouped endpoint
-///
-/// Returns consecutive time buckets with price-level trade aggregations.
-/// Each bucket is `timeframe` wide.
-#[derive(Debug, Deserialize)]
-pub struct GroupedTradeQuery {
-    /// Venue filter, e.g. "binance" (used with `market` to derive exchange).
-    venue: String,
-    /// Symbol filter.
-    symbol: String,
-    /// Market filter: "spot", "linear", or "inverse" (used with `venue`).
-    market: String,
-    /// Start of the first time bucket (milliseconds since epoch).
-    /// When omitted, defaults to `now - timeframe * limit`.
-    from: Option<i64>,
-    /// Number of consecutive time buckets to return (default 100, max 500).
-    limit: Option<usize>,
-    /// Integer multiplier applied to the exchange's minimum tick size
-    /// to produce the price bucket width (default 1).
-    step: Option<u16>,
-    /// Time-bucket width, e.g. "5m", "15m", "1h", "1d".
-    /// Required — see table above for usage patterns.
-    timeframe: Option<String>,
 }
 
 pub struct Server {
@@ -331,106 +303,6 @@ impl Server {
             .into_response()
     }
 
-    /// GET /trades/grouped
-    ///
-    /// Returns up to `limit` consecutive time buckets, each `timeframe` wide.
-    /// Within each bucket, trades are grouped by price level (tick-aligned via `step`).
-    async fn grouped_trades(
-        State(state): State<Arc<Self>>,
-        query: Query<GroupedTradeQuery>,
-    ) -> impl IntoResponse {
-        let tf_str = match &query.timeframe {
-            Some(tf) => tf,
-            None => {
-                return Self::json_err(
-                    StatusCode::BAD_REQUEST,
-                    "`timeframe` is required — e.g. ?timeframe=15m",
-                );
-            }
-        };
-
-        let bucket_tf = match parse_timeframe(tf_str) {
-            Some(tf) => tf,
-            None => {
-                return Self::json_err(
-                    StatusCode::BAD_REQUEST,
-                    "invalid timeframe — expected one of: \
-                     1m,3m,5m,15m,30m,1h,2h,4h,12h,1d",
-                );
-            }
-        };
-        let bucket_ms = bucket_tf.to_milliseconds() as i64;
-
-        let limit = query.limit.unwrap_or(100).min(500) as i64;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        let from = match query.from {
-            Some(f) => f,
-            None => now_ms - bucket_ms * limit,
-        };
-
-        let ex_str = match exchange_from_venue_market(&query.venue, &query.market) {
-            Some(ex) => ex,
-            None => {
-                return Self::json_err(
-                    StatusCode::BAD_REQUEST,
-                    "could not determine exchange from venue/market",
-                );
-            }
-        };
-
-        let info = match state.storage.get_ticker_info(&ex_str, &query.symbol) {
-            Ok(Some(info)) => info,
-            Ok(None) => {
-                return Self::json_err(
-                    StatusCode::NOT_FOUND,
-                    &format!("no ticker metadata for {}/{}", ex_str, query.symbol),
-                );
-            }
-            Err(e) => {
-                return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
-            }
-        };
-
-        let multiplier = query.step.unwrap_or(1).max(1) as f64;
-        let step_size = 10.0_f64.powi(info.min_ticksize.power as i32) * multiplier;
-
-        let price_precision = if info.min_ticksize.power < 0 {
-            -info.min_ticksize.power as u32
-        } else {
-            0
-        };
-
-        let qty_precision = if info.min_qty.power < 0 {
-            -info.min_qty.power as u32
-        } else {
-            0
-        };
-
-        let trade_query = TradeQuery {
-            venue: query.venue.clone(),
-            symbol: query.symbol.clone(),
-            market: query.market.clone(),
-            from: Some(from),
-            to: None,
-            limit: Some(limit as usize),
-        };
-
-        match state.storage.query_grouped_trades(
-            &trade_query,
-            bucket_ms,
-            step_size,
-            price_precision,
-            qty_precision,
-        ) {
-            Ok(buckets) => Self::json_ok(&Response::GroupedTrades { buckets }),
-            Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        }
-    }
-
     /// Bind to `bind_address` and spawn the axum HTTP(S) server.
     ///
     /// Uses plain HTTP for loopback addresses, HTTPS with a self-signed
@@ -454,7 +326,6 @@ impl Server {
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
             .route("/trades.parquet", get(Server::trades_parquet))
-            .route("/trades/grouped", get(Server::grouped_trades))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),
                 auth_middleware,
@@ -502,20 +373,4 @@ async fn auth_middleware(
         return Server::json_err(status, msg);
     }
     next.run(req).await
-}
-
-fn parse_timeframe(s: &str) -> Option<Timeframe> {
-    match s {
-        "1m" => Some(Timeframe::M1),
-        "3m" => Some(Timeframe::M3),
-        "5m" => Some(Timeframe::M5),
-        "15m" => Some(Timeframe::M15),
-        "30m" => Some(Timeframe::M30),
-        "1h" => Some(Timeframe::H1),
-        "2h" => Some(Timeframe::H2),
-        "4h" => Some(Timeframe::H4),
-        "12h" => Some(Timeframe::H12),
-        "1d" => Some(Timeframe::D1),
-        _ => None,
-    }
 }
