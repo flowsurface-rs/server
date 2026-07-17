@@ -172,68 +172,87 @@ impl Storage {
         Ok(trades)
     }
 
-    /// Export matching trades as a **real Parquet** byte blob.
+    /// Export matching trades as an **Arrow IPC stream**.
     ///
-    /// Writes a temporary Parquet file via DuckDB's native `COPY .. TO`
-    /// and returns the contents.  The temporary file is cleaned up after
-    /// reading.
-    ///
-    /// Uses a generous row cap appropriate for bulk Parquet downloads.
-    pub fn query_trades_parquet(&self, q: &TradeQuery) -> Result<Vec<u8>> {
+    /// Returns the complete Arrow IPC streaming format payload suitable
+    /// for HTTP response with `Content-Type: application/vnd.apache.arrow.stream`.
+    pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
         let conn = self.connection()?;
 
         let limit = q.limit.unwrap_or(100_000).min(1_000_000);
         let exchange = q.exchange_filter();
         let symbol_lower = q.symbol.to_lowercase();
 
-        // Escape single-quotes for inline SQL safety.
-        let exch_esc = exchange.replace('\'', "''");
-        let sym_esc = symbol_lower.replace('\'', "''");
-
-        let mut inner = format!(
+        let mut sql = String::from(
             "SELECT ts, price, qty, is_sell FROM trades \
-             WHERE symbol = '{sym_esc}' AND exchange = '{exch_esc}'",
+             WHERE symbol = ? AND exchange = ?",
         );
 
-        if let Some(from) = q.from {
-            inner.push_str(&format!(" AND ts >= {from}"));
+        if q.from.is_some() {
+            sql.push_str(" AND ts >= ?");
         }
-        if let Some(to) = q.to {
-            inner.push_str(&format!(" AND ts <= {to}"));
+        if q.to.is_some() {
+            sql.push_str(" AND ts <= ?");
         }
 
         if q.from.is_some() {
-            inner.push_str(" ORDER BY ts ASC");
+            sql.push_str(" ORDER BY ts ASC");
         } else {
-            inner.push_str(" ORDER BY ts DESC");
+            sql.push_str(" ORDER BY ts DESC");
         }
-        inner.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(&format!(" LIMIT {limit}"));
 
-        // Unique temp-file path (PID + timestamp).
-        let tmp_dir = std::env::temp_dir();
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_path = tmp_dir.join(format!("trades_{}_{}.parquet", std::process::id(), now_ns));
-        let tmp_str = tmp_path.display().to_string();
+        let mut params: Vec<&dyn duckdb::ToSql> = vec![&symbol_lower, &exchange];
+        if let Some(ref from) = q.from {
+            params.push(from);
+        }
+        if let Some(ref to) = q.to {
+            params.push(to);
+        }
 
-        // Single-shot COPY TO — DuckDB parses the inner SELECT itself.
-        // The `parquet` Cargo feature is required so the extension is
-        // statically linked; otherwise DuckDB tries to autoload at
-        // runtime and segfaults in an offline environment.
-        let copy_sql = format!("COPY ({inner}) TO '{tmp_str}' (FORMAT 'parquet', CODEC 'zstd')",);
+        let mut stmt = conn.prepare(&sql).context("preparing Arrow IPC query")?;
 
-        conn.execute_batch(&copy_sql)
-            .context("exporting trades to Parquet file")?;
+        let batches: Vec<arrow::record_batch::RecordBatch> = stmt
+            .query_arrow(&params[..])
+            .context("executing Arrow query")?
+            .collect();
 
-        let bytes = std::fs::read(&tmp_path).context("reading Parquet file")?;
+        // Drop the statement so the connection is free for the IPC writer.
+        drop(stmt);
 
-        // Best-effort cleanup.
-        std::fs::remove_file(&tmp_path).ok();
+        let mut buf = Vec::new();
+        {
+            use arrow::datatypes::{DataType, Field, Schema};
+            use arrow::ipc::writer::StreamWriter;
+            use std::sync::Arc;
 
-        tracing::debug!("Exported {} bytes of Parquet data", bytes.len());
-        Ok(bytes)
+            let schema: Arc<Schema> = if batches.is_empty() {
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::Int64, false),
+                    Field::new("price", DataType::Float64, false),
+                    Field::new("qty", DataType::Float64, false),
+                    Field::new("is_sell", DataType::Boolean, false),
+                ]))
+            } else {
+                batches[0].schema()
+            };
+
+            let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
+                .context("creating Arrow IPC stream writer")?;
+
+            for batch in &batches {
+                writer.write(batch).context("writing Arrow record batch")?;
+            }
+
+            writer.finish().context("finishing Arrow IPC stream")?;
+        }
+
+        tracing::debug!(
+            "Exported {} bytes of Arrow IPC data ({} batch(es))",
+            buf.len(),
+            batches.len()
+        );
+        Ok(buf)
     }
 
     /// Persist ticker metadata for every resolved pair so the API can

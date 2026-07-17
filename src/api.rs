@@ -261,27 +261,32 @@ impl Server {
         }
     }
 
-    /// GET /trades.parquet
+    /// GET /trades.arrow
     ///
-    /// Returns trades as a **real Parquet** file, exported directly from
-    /// DuckDB via `COPY (SELECT ...) TO 'file.parquet'`.  The Parquet
-    /// schema uses the same 4 columns the Rust client expects:
-    /// `ts (int64)`, `price (double)`, `qty (double)`, `is_sell (bool)`.
-    async fn trades_parquet(
+    /// Returns trades as an **Arrow IPC stream**, exported directly from
+    /// DuckDB via Arrow export.
+    ///
+    /// The Arrow IPC streaming format uses 4 columns:
+    /// `ts (int64)`, `price (float64)`,
+    /// `qty (float64)`, `is_sell (bool)`.
+    ///
+    /// This endpoint uses parameterised queries internally (safe from SQL
+    /// injection).
+    async fn trades_arrow(
         State(state): State<Arc<Self>>,
         query: Query<TradeQuery>,
     ) -> axum::response::Response {
-        let limit = query.limit.unwrap_or(10_000).min(100_000);
+        let limit = query.limit.unwrap_or(100_000).min(1_000_000);
 
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 
-        let parquet_bytes = match state.storage.query_trades_parquet(&bounded) {
+        let arrow_bytes = match state.storage.query_trades_arrow_ipc(&bounded) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Server::json_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("parquet export: {e:#}"),
+                    &format!("arrow export: {e:#}"),
                 );
             }
         };
@@ -291,14 +296,14 @@ impl Server {
             [
                 (
                     axum::http::header::CONTENT_TYPE,
-                    "application/vnd.apache.parquet",
+                    "application/vnd.apache.arrow.stream",
                 ),
                 (
                     axum::http::header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"trades.parquet\"",
+                    "attachment; filename=\"trades.arrow\"",
                 ),
             ],
-            parquet_bytes,
+            arrow_bytes,
         )
             .into_response()
     }
@@ -325,7 +330,7 @@ impl Server {
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
-            .route("/trades.parquet", get(Server::trades_parquet))
+            .route("/trades.arrow", get(Server::trades_arrow))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),
                 auth_middleware,
