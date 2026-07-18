@@ -4,5 +4,6 @@
 *.toml
 !Cargo.toml
 !config.example.toml
+!dist-workspace.toml
 .DS_Store
 *.log

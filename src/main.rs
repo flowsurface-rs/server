@@ -1,11 +1,13 @@
 mod api;
+mod cleanup;
 mod config;
 mod discovery;
 mod ingestion;
 mod storage;
 mod tls;
 
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -18,7 +20,7 @@ use flowsurface_exchange::adapter::{AdapterHandles, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
-use crate::config::{Args, Config};
+use crate::config::{Args, BearerToken, Config};
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -45,7 +47,16 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let app = App::new(&config).await;
+    let data_dir = if Path::new(&config.data_dir).is_relative() {
+        config_path
+            .parent()
+            .expect("config path has no parent")
+            .join(&config.data_dir)
+    } else {
+        PathBuf::from(&config.data_dir)
+    };
+
+    let app = App::new(&config, &data_dir).await;
     let handles = app.serve().await;
     handles.shutdown().await;
 }
@@ -55,24 +66,34 @@ struct App {
     adapter_handles: AdapterHandles,
     resolved_pairs: Vec<TickerInfo>,
     metadata_cache: discovery::MetadataCache,
-    bind_address: String,
-    auth_token: Option<String>,
+    bind_address: SocketAddr,
+    auth_token: Option<BearerToken>,
     flush_interval: std::time::Duration,
     max_buffered_trades: usize,
-    data_retention_hours: u64,
+    cleanup_scheduler: cleanup::CleanupScheduler,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
 }
 
 impl App {
     /// Open storage, resolve configured pairs, persist ticker metadata.
-    async fn new(config: &Config) -> Self {
-        let data_dir = PathBuf::from(&config.data_dir);
-        let storage = Storage::open(&data_dir).unwrap_or_else(|e| {
+    async fn new(config: &Config, data_dir: &Path) -> Self {
+        let storage = Storage::open(data_dir).unwrap_or_else(|e| {
             tracing::error!("Failed to initialise storage: {e:#}");
             std::process::exit(1);
         });
 
-        storage.run_cleanup(config.data_retention_hours);
+        let cleanup_config =
+            cleanup::CleanupConfig::from_config(config.data_retention_hours, config.max_storage_mb)
+                .unwrap_or_else(|e| {
+                    tracing::error!("Invalid cleanup configuration: {e:#}");
+                    std::process::exit(1);
+                });
+
+        let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config)
+            .unwrap_or_else(|e| {
+                tracing::error!("{e:#}");
+                std::process::exit(1);
+            });
 
         let whitelist = config.resolve_whitelist();
         if !config.discovery_mode && (whitelist.is_empty() || config.base_assets.is_empty()) {
@@ -128,16 +149,12 @@ impl App {
         }
 
         // Only generate TLS cert for non-loopback addresses.
-        let addr: std::net::SocketAddr = config
-            .bind_address
-            .parse()
-            .expect("bind_address already validated");
-
-        let tls_config = if addr.ip().is_loopback() {
+        let tls_config = if config.bind_address.ip().is_loopback() {
             None
         } else {
             let tls_domain = config.tls_domain.clone();
-            let bind_ip = (!addr.ip().is_unspecified()).then_some(addr.ip());
+            let bind_ip =
+                (!config.bind_address.ip().is_unspecified()).then_some(config.bind_address.ip());
 
             let cert_path = data_dir.join("cert.pem");
             let key_path = data_dir.join("key.pem");
@@ -194,12 +211,12 @@ impl App {
             adapter_handles,
             resolved_pairs,
             metadata_cache,
-            bind_address: config.bind_address.clone(),
+            bind_address: config.bind_address,
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             max_buffered_trades: config.max_buffered_trades,
-            data_retention_hours: config.data_retention_hours,
             tls_config,
+            cleanup_scheduler,
         }
     }
 
@@ -208,6 +225,13 @@ impl App {
         let (trade_tx, trade_rx) = mpsc::unbounded_channel::<api::AnnotatedTrade>();
         let shutdown = CancellationToken::new();
 
+        let cleanup_last_run = tokio::task::spawn_blocking({
+            let scheduler = self.cleanup_scheduler.clone();
+            move || scheduler.run_pass()
+        })
+        .await
+        .unwrap_or(None);
+
         let flusher = self.storage.spawn_batch_flusher(
             trade_rx,
             self.flush_interval,
@@ -215,8 +239,8 @@ impl App {
         );
 
         let _cleanup = self
-            .storage
-            .spawn_periodic_cleanup(self.data_retention_hours, shutdown.child_token());
+            .cleanup_scheduler
+            .spawn(cleanup_last_run, shutdown.child_token());
 
         let ingest = ingestion::start_all_ingest_tasks(
             &self.resolved_pairs,
@@ -237,7 +261,7 @@ impl App {
             available_tickers,
             self.tls_config,
         ));
-        let server_handle = server.serve(&self.bind_address).await;
+        let server_handle = server.serve(self.bind_address).await;
 
         AppHandles {
             shutdown,
