@@ -6,65 +6,43 @@ use tokio_util::sync::CancellationToken;
 
 use crate::storage::Storage;
 
-/// Minimum delay between cleanup attempts, regardless of schedule.
-///
-/// This prevents a tight retry loop when `delay_until_next_cleanup`
-/// returns zero (e.g. because the last time-based cleanup failed and
-/// `last_cleanup` is stale).
+/// Floor on delay between cleanup passes; prevents tight retry loops
+/// when `last_cleanup` is stale (first run or previous pass failed).
 const MIN_CLEANUP_DELAY: Duration = Duration::from_secs(60);
 
-/// How often the size-based cleanup task wakes up to check whether the
-/// database has exceeded the `max_storage_mb` cap.
-///
-/// This interval only matters when a size cap is configured *and* the
-/// time-based retention window is longer than 5 minutes — otherwise the
-/// time-based schedule dominates.
+/// Wake interval for the size-cap check.  Only matters when a size cap
+/// is configured and the retention window is longer than this.
 const SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Estimated on-disk bytes per trade row.
-///
-/// DuckDB's columnar storage compresses the schema well: exchange
-/// names dictionary-compress to ~1–2 bytes, symbols to ~2–5 bytes,
-/// timestamps benefit from delta encoding, and `DOUBLE` columns
-/// compress modestly.  Empirically ~40–60 bytes per row including
-/// row-group overhead.
-///
-/// Used only as a fast-path threshold in the size-based purge loop —
-/// the authoritative check is the actual filesystem file size after
-/// `CHECKPOINT`.  A conservative (lower) value here means we more
-/// often verify with the real file size, which is safer.
+/// Safety ceiling for the size-based purge loop (200 × 100k = 20M rows).
+const MAX_PURGE_ITERATIONS: usize = 200;
+
+/// Conservative estimate of on-disk bytes per trade row.  Used only as
+/// a fast-path threshold; the authoritative check is the real file
+/// size after `CHECKPOINT`.
 const EST_BYTES_PER_ROW: u64 = 50;
 
-/// Choose a batch size proportional to `max_bytes` so that each purge
-/// iteration deletes ~10% of the cap.
-///
-/// Clamped to **[1 000, 100 000]** so tiny caps still make progress
-/// and huge caps don't create giant transactions.
+/// Batch size for each purge iteration — ~10% of the cap, clamped to
+/// [1 000, 100 000].
 fn purge_batch_size(max_bytes: u64) -> i64 {
     const MIN_ROWS: i64 = 1_000;
     const MAX_ROWS: i64 = 100_000;
-
-    // Target ~10% of the cap per iteration.
     let rows = (max_bytes / 10 / EST_BYTES_PER_ROW) as i64;
     rows.clamp(MIN_ROWS, MAX_ROWS)
 }
 
-/// Groups the two retention parameters that are always passed together.
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupConfig {
-    /// Time-based retention: trades older than this are purged.
+    /// Trades older than this are purged.
     pub retention_hours: u64,
-    /// Optional hard cap on total DB+WAL size in bytes.  When set, the
-    /// oldest trades are purged even if within the retention window.
+    /// Optional hard cap on total DB+WAL size in bytes.
     pub max_storage_bytes: Option<u64>,
 }
 
 impl CleanupConfig {
-    /// Derive the config from the user-facing `max_storage_mb` setting.
-    /// A value of `0` or `None` means no cap.
-    ///
-    /// Returns an error if `retention_hours` is zero, which would purge
-    /// all trades on every cleanup pass.
+    /// Derive from user-facing settings.  `max_storage_mb` of `0` or
+    /// `None` disables the cap.  Returns an error if
+    /// `retention_hours` is zero.
     pub fn from_config(retention_hours: u64, max_storage_mb: Option<u64>) -> anyhow::Result<Self> {
         if retention_hours == 0 {
             anyhow::bail!(
@@ -82,20 +60,14 @@ impl CleanupConfig {
     }
 }
 
-/// Owns the cleanup lifecycle: startup guard, startup pass, and the
-/// periodic background task.
-///
-/// Created in [`CleanupScheduler::new`] which runs the startup guard.
-/// Call [`spawn`](Self::spawn) to start the periodic task — this also
-/// runs the startup cleanup pass on a blocking thread and feeds its
-/// result into the scheduler so the first periodic delay is accurate.
 pub struct CleanupScheduler {
     storage: Storage,
     config: CleanupConfig,
 }
 
 impl CleanupScheduler {
-    /// Create the scheduler and run the startup guard.
+    /// Create the scheduler and run the startup guard, which exits
+    /// the process if the database is > 2× the configured cap.
     pub fn new(storage: &Storage, config: CleanupConfig) -> Self {
         if let Some(max) = config.max_storage_bytes {
             tracing::info!(
@@ -140,13 +112,14 @@ impl CleanupScheduler {
         }
     }
 
-    /// Run a single cleanup pass (time-based retention + optional size
-    /// cap + checkpoint + record timestamp).
+    /// Run one cleanup pass: time-based retention, optional size-cap
+    /// purge, checkpoint, and record `last_cleanup`.
     ///
-    /// Returns `Some(ts)` when the time-based purge succeeded and the
-    /// `last_cleanup` timestamp was recorded, or `None` on failure.
+    /// Returns `Some(last_cleanup_ts)` on success, or `None` if the
+    /// pass failed (e.g. time-based purge errored or recording the
+    /// timestamp failed).
     fn run_pass(&self) -> Option<i64> {
-        let mut time_purge_deleted = false;
+        let mut any_deleted = false;
         let mut time_cleanup_ok = false;
 
         match self.storage.purge_old_trades(self.config.retention_hours) {
@@ -157,7 +130,7 @@ impl CleanupScheduler {
                         "Cleaned up {n} trade(s) older than {}h",
                         self.config.retention_hours
                     );
-                    time_purge_deleted = true;
+                    any_deleted = true;
                 }
             }
             Err(e) => {
@@ -165,172 +138,119 @@ impl CleanupScheduler {
             }
         }
 
-        let size_cap_ran = self.config.max_storage_bytes.is_some();
         if let Some(max_bytes) = self.config.max_storage_bytes {
             match self.purge_oldest_trades_until_below(max_bytes) {
-                Ok(n) => {
-                    if n > 0 {
-                        let current_mb = self
-                            .storage
-                            .current_storage_bytes()
-                            .map(|b| b / (1024 * 1024))
-                            .unwrap_or(0);
-                        tracing::info!(
-                            "Cleaned up {n} trade(s) to keep storage under cap \
-                             (max {} MB, now ~{current_mb} MB)",
-                            max_bytes / (1024 * 1024),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Storage-cap cleanup failed: {e:#}");
-                }
+                Ok(n) if n > 0 => any_deleted = true,
+                Err(e) => tracing::error!("Storage-cap cleanup failed: {e:#}"),
+                _ => {}
             }
         }
 
-        if time_purge_deleted
-            && !size_cap_ran
-            && let Err(e) = self.storage.run_checkpoint()
-        {
-            tracing::warn!("Failed to checkpoint DuckDB WAL after cleanup: {e:#}");
+        if any_deleted {
+            if let Err(e) = self.storage.run_checkpoint() {
+                tracing::warn!("Failed to checkpoint DuckDB WAL after cleanup: {e:#}");
+            }
         }
 
-        let mut last_cleanup_ts: Option<i64> = None;
         if time_cleanup_ok {
             match self.storage.record_cleanup() {
-                Ok(ts) => last_cleanup_ts = Some(ts),
+                Ok(ts) => return Some(ts),
                 Err(e) => tracing::warn!("Failed to record last_cleanup timestamp: {e:#}"),
             }
         }
-        last_cleanup_ts
+        None
     }
 
-    /// Delete the oldest trades until the on-disk size drops below
-    /// `max_bytes`.  Returns the total number of deleted rows.
-    ///
-    /// The authoritative convergence criterion is the actual filesystem
-    /// size after `CHECKPOINT`.  A row-count estimate
-    /// (`COUNT(*) × EST_BYTES_PER_ROW`) is used as a fast path: when
-    /// the row count is clearly above the estimated target we purge
-    /// without an expensive `CHECKPOINT`; when it's below we verify
-    /// with the real file size to guard against estimation errors.
-    ///
-    /// After purging, if a significant fraction of the data was freed,
-    /// a `VACUUM` is run to reclaim filesystem space — `CHECKPOINT`
-    /// alone doesn't shrink the main database file.
-    fn purge_oldest_trades_until_below(&self, max_bytes: u64) -> Result<u64> {
-        /// Safety ceiling: if the purge hasn't converged after this
-        /// many iterations, something is wrong.  200 × 100k batch =
-        /// 20M rows — far beyond any plausible cap.  Bail out rather
-        /// than looping forever.
-        const MAX_ITERATIONS: usize = 200;
+    /// Check whether storage is at or below `max_bytes`, using a
+    /// two-tier test: a cheap row-count estimate first, falling back
+    /// to an authoritative file-size check (which requires a
+    /// `CHECKPOINT`) only when the estimate is borderline.
+    fn is_storage_under_cap(&self, max_bytes: u64, max_est_rows: u64) -> Result<bool> {
+        if self.storage.count_trades()? > max_est_rows {
+            return Ok(false);
+        }
+        self.storage.run_checkpoint()?;
+        Ok(self.storage.current_storage_bytes()? <= max_bytes)
+    }
 
+    /// Delete oldest trades until on-disk size ≤ `max_bytes`.
+    fn purge_oldest_trades_until_below(&self, max_bytes: u64) -> Result<u64> {
         let max_est_rows = max_bytes.saturating_div(EST_BYTES_PER_ROW);
         let batch_size = purge_batch_size(max_bytes);
         let mut total_deleted = 0u64;
+        let mut converged = false;
 
-        for _iteration in 0..MAX_ITERATIONS {
-            // ── Fast path: row count ───────────────────────────
-            // COUNT(*) in DuckDB is a metadata operation on
-            // row-group headers — cheap even on large tables.
-            //
-            // If the row count is clearly above the estimated
-            // target we purge without an expensive CHECKPOINT.
-            // If it's below, the estimate may be wrong so we
-            // fall through to the authoritative file-size check.
-            let current_rows = self.storage.count_trades()?;
-
-            if current_rows <= max_est_rows {
-                // ── Authoritative criterion: file size ──────
-                // CHECKPOINT first so the WAL doesn't inflate
-                // the filesystem size check.
-                self.storage.run_checkpoint()?;
-
-                let file_size = self.storage.current_storage_bytes()?;
-                if file_size <= max_bytes {
-                    tracing::debug!(
-                        "Size-based purge: file size {file_size} ≤ \
-                         cap {max_bytes}, stopping"
-                    );
-                    break;
-                }
-                // Row count says we're under, but the file is
-                // still over the cap — our estimate was too
-                // optimistic.  Continue purging.
+        for _ in 0..MAX_PURGE_ITERATIONS {
+            if self.is_storage_under_cap(max_bytes, max_est_rows)? {
+                converged = true;
+                break;
             }
-
             let deleted = self.storage.delete_oldest_trades_batch(batch_size)?;
             if deleted == 0 {
+                converged = true;
                 break;
             }
             total_deleted += deleted;
         }
 
         if total_deleted > 0 {
-            // CHECKPOINT to merge the WAL, then VACUUM if we've
-            // freed a significant fraction of the data — DuckDB's
-            // CHECKPOINT only merges the WAL, it doesn't shrink the
-            // main file.  VACUUM rewrites the database to reclaim
-            // filesystem space, but is O(n) in remaining rows so
-            // we only run it when the payoff is worth it.
             self.storage.run_checkpoint()?;
-
             let remaining_rows = self.storage.count_trades()?;
 
-            // VACUUM when we've freed at least ~20% of the
-            // remaining data — enough to reclaim meaningful space
-            // without running an expensive rewrite on every pass.
-            if remaining_rows == 0 || total_deleted >= remaining_rows / 4 {
-                self.storage.vacuum()?;
-                tracing::debug!(
-                    "VACUUMed database after purging {total_deleted} rows \
-                     ({remaining_rows} remaining)"
+            if converged {
+                let current_mb = self
+                    .storage
+                    .current_storage_bytes()
+                    .map(|b| b / (1024 * 1024))
+                    .unwrap_or(0);
+                tracing::info!(
+                    "Cleaned up {total_deleted} trade(s) to keep storage under cap \
+                     (max {} MB, now ~{current_mb} MB)",
+                    max_bytes / (1024 * 1024),
                 );
+            } else {
+                tracing::warn!(
+                    "Size-cap purge did not converge after \
+                     {MAX_PURGE_ITERATIONS} iterations (deleted {total_deleted} \
+                     rows); storage may still exceed the {} MB cap",
+                    max_bytes / (1024 * 1024),
+                );
+            }
+
+            if should_vacuum(total_deleted, remaining_rows) {
+                if let Err(e) = self.storage.vacuum() {
+                    tracing::warn!(
+                        "VACUUM after size-cap purge failed (data is \
+                         correct, but filesystem space wasn't reclaimed): \
+                         {e:#}"
+                    );
+                } else {
+                    tracing::debug!(
+                        "VACUUMed database after purging {total_deleted} \
+                         rows ({remaining_rows} remaining)"
+                    );
+                }
             }
         }
 
         Ok(total_deleted)
     }
 
-    /// Spawn the startup cleanup and the periodic background task.
-    ///
-    /// Returns the `JoinHandle` for the periodic task (and the startup
-    /// task is awaited internally by the periodic task).
+    /// Spawn the startup cleanup and periodic background task.
     pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
-        let Self { storage, config } = self;
-
-        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
-
-        // Startup cleanup on a blocking thread.
-        let startup_handle = {
-            let scheduler = CleanupScheduler {
-                storage: storage.clone(),
-                config,
-            };
-            tokio::task::spawn_blocking(move || {
-                let result = scheduler.run_pass();
-                let _ = startup_tx.send(result);
-            })
-        };
+        let storage = self.storage.clone();
+        let config = self.config;
 
         let retention_ms = (config.retention_hours as i64) * 3_600_000;
 
         tokio::spawn(async move {
-            // Await the startup cleanup so we have an accurate
-            // `last_cleanup` timestamp before scheduling the next
-            // pass.
-            let mut last_cleanup = tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    tracing::info!("Periodic cleanup shut down.");
-                    return;
-                }
-                result = startup_rx => result.ok().flatten(),
-            };
-
-            // Also await the startup task's JoinHandle so it is
-            // properly joined on shutdown (not detached).
-            let _ = startup_handle.await;
+            // Run startup cleanup pass on a blocking thread first.
+            let mut last_cleanup = tokio::task::spawn_blocking({
+                let storage = storage.clone();
+                move || CleanupScheduler { storage, config }.run_pass()
+            })
+            .await
+            .unwrap_or(None);
 
             loop {
                 let time_delay = Self::delay_until_next_cleanup(last_cleanup, retention_ms);
@@ -349,16 +269,14 @@ impl CleanupScheduler {
                         break;
                     }
                     _ = tokio::time::sleep(delay) => {
-                        let scheduler = CleanupScheduler {
-                            storage: storage.clone(),
-                            config,
-                        };
-                        let result = tokio::task::spawn_blocking(move || {
-                            scheduler.run_pass()
+                        let result = tokio::task::spawn_blocking({
+                            let storage = storage.clone();
+                            move || {
+                                CleanupScheduler { storage, config }.run_pass()
+                            }
                         })
                         .await
-                        .ok()
-                        .flatten();
+                        .unwrap_or(None);
                         if let Some(ts) = result {
                             last_cleanup = Some(ts);
                         }
@@ -369,13 +287,11 @@ impl CleanupScheduler {
     }
 
     fn delay_until_next_cleanup(last_cleanup_ms: Option<i64>, retention_ms: i64) -> Duration {
-        let now_ms = Self::now_ms();
+        let now_ms = Storage::now_ms();
 
         let Some(anchor_ms) = last_cleanup_ms else {
-            // No last_cleanup recorded — either this is the first run
-            // or the previous cleanup pass failed.  Return zero so the
-            // caller (which applies `MIN_CLEANUP_DELAY`) retries quickly
-            // rather than waiting a full retention period.
+            // No recorded timestamp — retry quickly (caller applies
+            // `MIN_CLEANUP_DELAY`).
             return Duration::ZERO;
         };
 
@@ -386,11 +302,10 @@ impl CleanupScheduler {
             Duration::from_millis((next_ms - now_ms) as u64)
         }
     }
+}
 
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
-    }
+/// Whether VACUUM is worth running after a purge — only when we've
+/// freed at least ~25% of the remaining data.
+fn should_vacuum(total_deleted: u64, remaining_rows: u64) -> bool {
+    remaining_rows == 0 || total_deleted >= remaining_rows / 4
 }

@@ -175,10 +175,9 @@ impl Storage {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            duckdb::Error::InvalidParameterName("VACUUM produced no error".into())
-        }))
-        .with_context(|| format!("vacuuming DuckDB database after {MAX_RETRIES} attempts"))
+        // SAFETY: the loop always sets `last_err` before reaching this point.
+        Err(last_err.unwrap())
+            .with_context(|| format!("vacuuming DuckDB database after {MAX_RETRIES} attempts"))
     }
 
     /// Merge the DuckDB WAL into the main database file, then truncate
@@ -465,7 +464,7 @@ impl Storage {
         }
     }
 
-    fn now_ms() -> i64 {
+    pub(crate) fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
