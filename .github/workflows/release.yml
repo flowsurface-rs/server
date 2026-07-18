@@ -31,9 +31,6 @@ jobs:
                       os: ubuntu-26.04-arm
                       container: ubuntu:22.04
                       target_triple: aarch64-unknown-linux-gnu
-                    - name: macos-aarch64
-                      os: macos-latest
-                      target_triple: aarch64-apple-darwin
         runs-on: ${{ matrix.target.os }}
         container: ${{ matrix.target.container }}
         steps:
@@ -53,12 +50,23 @@ jobs:
             - name: Build release
               run: cargo build --release --target ${{ matrix.target.target_triple }}
 
+            - name: Determine tag
+              id: tag
+              run: |
+                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                    echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+                  fi
+
             - name: Package archive
               id: package
               shell: bash
               run: |
-                  ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target.target_triple }}.tar.gz"
-                  STAGING="${{ runner.temp }}/staging"
+                  TAG="${{ steps.tag.outputs.tag }}"
+                  ARCHIVE_NAME="${{ env.BINARY_NAME }}-${TAG}-${{ matrix.target.target_triple }}.tar.gz"
+                  RELEASE_DIR="${{ env.BINARY_NAME }}-${TAG}-${{ matrix.target.target_triple }}"
+                  STAGING="$GITHUB_WORKSPACE/staging/$RELEASE_DIR"
                   mkdir -p "$STAGING"
 
                   cp "target/${{ matrix.target.target_triple }}/release/${{ env.BINARY_NAME }}" "$STAGING/"
@@ -66,9 +74,9 @@ jobs:
                     [ -f "$file" ] && cp "$file" "$STAGING/"
                   done
 
-                  cd "$STAGING"
-                  tar czf "${{ runner.temp }}/$ARCHIVE_NAME" .
-                  echo "archive_path=${{ runner.temp }}/$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
+                  cd "$GITHUB_WORKSPACE/staging"
+                  tar czf "$GITHUB_WORKSPACE/$ARCHIVE_NAME" "$RELEASE_DIR"
+                  echo "archive_path=$GITHUB_WORKSPACE/$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
 
             - name: Upload artifact
               uses: actions/upload-artifact@v4
@@ -101,6 +109,11 @@ jobs:
                   cd artifacts
                   find . -type f -exec sha256sum {} \; | sed 's|\./||' > SHA256SUMS
                   cat SHA256SUMS
+
+            - name: Create tag
+              run: |
+                  git tag "${{ steps.tag.outputs.tag }}"
+                  git push origin "${{ steps.tag.outputs.tag }}"
 
             - name: Create release
               uses: softprops/action-gh-release@v2
