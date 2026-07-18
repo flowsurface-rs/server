@@ -4,7 +4,10 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::Storage;
+use crate::{
+    config::{RetentionHours, StorageBytes},
+    storage::Storage,
+};
 
 /// Floor on delay between cleanup passes; prevents tight retry loops
 /// when `last_cleanup` is stale (first run or previous pass failed).
@@ -38,9 +41,9 @@ fn purge_batch_size(max_bytes: u64) -> i64 {
 #[derive(Debug, Clone, Copy)]
 pub struct CleanupConfig {
     /// Trades older than this are purged.
-    pub retention_hours: u64,
+    pub retention_hours: RetentionHours,
     /// Optional hard cap on total DB+WAL size in bytes.
-    pub max_storage_bytes: Option<u64>,
+    pub max_storage_bytes: Option<StorageBytes>,
 }
 
 impl CleanupConfig {
@@ -48,15 +51,10 @@ impl CleanupConfig {
     /// `None` disables the cap.  Returns an error if
     /// `retention_hours` is zero.
     pub fn from_config(retention_hours: u64, max_storage_mb: Option<u64>) -> anyhow::Result<Self> {
-        if retention_hours == 0 {
-            anyhow::bail!(
-                "data_retention_hours must be > 0 (got 0) — \
-                 a zero retention period would purge all trades on every cleanup pass"
-            );
-        }
+        let retention_hours = RetentionHours::new(retention_hours)?;
         let max_storage_bytes = max_storage_mb
             .filter(|&mb| mb > 0)
-            .map(|mb| mb.saturating_mul(1024 * 1024));
+            .map(StorageBytes::from_mb);
         Ok(Self {
             retention_hours,
             max_storage_bytes,
@@ -81,7 +79,7 @@ impl CleanupScheduler {
         if let Some(max) = config.max_storage_bytes {
             tracing::info!(
                 "Storage hard cap enabled: {} MB (will purge oldest trades when exceeded)",
-                max / (1024 * 1024)
+                max.as_mb(),
             );
 
             match storage.current_storage_bytes() {
@@ -93,17 +91,17 @@ impl CleanupScheduler {
                          a misconfiguration.  Either raise max_storage_mb \
                          (e.g. to {} MB or higher) or manually shrink the \
                          database and restart.",
-                        current / (1024 * 1024),
-                        max / (1024 * 1024),
-                        (current / (1024 * 1024)).saturating_add(1),
+                        current.as_mb(),
+                        max.as_mb(),
+                        current.as_mb().saturating_add(1),
                     );
                 }
                 Ok(current) if current > max => {
                     tracing::warn!(
                         "Database is {} MB — above the {} MB cap; \
                          startup cleanup will purge oldest trades.",
-                        current / (1024 * 1024),
-                        max / (1024 * 1024),
+                        current.as_mb(),
+                        max.as_mb(),
                     );
                 }
                 Err(e) => {
@@ -135,7 +133,7 @@ impl CleanupScheduler {
                 if n > 0 {
                     tracing::info!(
                         "Cleaned up {n} trade(s) older than {}h",
-                        self.config.retention_hours
+                        self.config.retention_hours.as_hours()
                     );
                     any_deleted = true;
                 }
@@ -176,10 +174,11 @@ impl CleanupScheduler {
     ///
     /// Targets `HEADROOM_FRACTION / 5` of the cap so there is headroom for
     /// incoming trades between 5-minute checks.
-    fn purge_oldest_trades_until_below(&self, max_bytes: u64) -> Result<u64> {
-        let target_bytes = max_bytes.saturating_mul(HEADROOM_FRACTION) / 5;
-        let max_est_rows = target_bytes.saturating_div(EST_BYTES_PER_ROW);
-        let batch_size = purge_batch_size(target_bytes);
+    fn purge_oldest_trades_until_below(&self, max_bytes: StorageBytes) -> Result<u64> {
+        let target_bytes =
+            StorageBytes::from_bytes(max_bytes.as_bytes().saturating_mul(HEADROOM_FRACTION) / 5);
+        let max_est_rows = target_bytes.as_bytes().saturating_div(EST_BYTES_PER_ROW);
+        let batch_size = purge_batch_size(target_bytes.as_bytes());
         let mut total_deleted = 0u64;
         let mut converged = false;
 
@@ -202,20 +201,20 @@ impl CleanupScheduler {
             let remaining_rows = self.storage.count_trades()?;
 
             if converged {
-                let current_bytes = self.storage.current_storage_bytes()?;
-                if current_bytes <= max_bytes {
+                let current = self.storage.current_storage_bytes()?;
+                if current <= max_bytes {
                     tracing::info!(
                         "Cleaned up {total_deleted} trade(s) to keep storage under \
                          {} MB cap (now ~{} MB)",
-                        max_bytes / (1024 * 1024),
-                        current_bytes / (1024 * 1024),
+                        max_bytes.as_mb(),
+                        current.as_mb(),
                     );
                 } else {
                     tracing::warn!(
                         "Storage ({} MB) still exceeds {} MB cap after cleanup. \
                          The next periodic pass will retry.",
-                        current_bytes / (1024 * 1024),
-                        max_bytes / (1024 * 1024),
+                        current.as_mb(),
+                        max_bytes.as_mb(),
                     );
                 }
             } else {
@@ -223,7 +222,7 @@ impl CleanupScheduler {
                     "Size-cap purge did not converge after \
                      {MAX_PURGE_ITERATIONS} iterations (deleted {total_deleted} \
                      rows); storage may still exceed the {} MB cap",
-                    max_bytes / (1024 * 1024),
+                    max_bytes.as_mb(),
                 );
             }
 
@@ -258,7 +257,7 @@ impl CleanupScheduler {
         let storage = self.storage.clone();
         let config = self.config;
 
-        let retention_ms = (config.retention_hours as i64) * 3_600_000;
+        let retention_ms = config.retention_hours.as_millis();
 
         tokio::spawn(async move {
             let mut last_cleanup = last_cleanup;

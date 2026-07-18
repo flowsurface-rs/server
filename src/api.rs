@@ -17,7 +17,10 @@ use flowsurface_exchange::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{PairInfo, Storage};
+use crate::{
+    config::BearerToken,
+    storage::{PairInfo, Storage},
+};
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -100,7 +103,7 @@ pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
 pub struct Server {
     pub storage: Storage,
     pub startup: Instant,
-    pub auth_token: Option<String>,
+    pub auth_token: Option<BearerToken>,
     /// The tickers configured at startup.
     /// Used by `/pairs` to include pairs that have not yet received trades.
     pub configured_pairs: Vec<Ticker>,
@@ -115,7 +118,7 @@ pub struct Server {
 impl Server {
     pub fn new(
         storage: Storage,
-        auth_token: Option<String>,
+        auth_token: Option<BearerToken>,
         configured_pairs: Vec<Ticker>,
         available_tickers: HashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
@@ -146,9 +149,7 @@ impl Server {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let expected = format!("Bearer {expected_token}");
-
-        if !provided.eq_ignore_ascii_case(&expected) {
+        if !expected_token.is_valid_authorization(provided) {
             let truncated: String = provided.chars().take(20).collect();
             tracing::warn!(
                 "Auth failure from {}: expected valid Bearer token, got '{truncated}'",
@@ -312,12 +313,7 @@ impl Server {
     ///
     /// Uses plain HTTP for loopback addresses, HTTPS with a self-signed
     /// certificate for non-loopback (remote) binds.  Exits on bind failure.
-    pub async fn serve(self: Arc<Self>, bind_address: &str) -> tokio::task::JoinHandle<()> {
-        let addr: SocketAddr = bind_address.parse().unwrap_or_else(|e| {
-            tracing::error!("Invalid bind_address '{bind_address}': {e}");
-            std::process::exit(1);
-        });
-
+    pub async fn serve(self: Arc<Self>, bind_address: SocketAddr) -> tokio::task::JoinHandle<()> {
         let tls_config = self.tls_config.clone();
 
         // Public routes — no auth required
@@ -341,17 +337,17 @@ impl Server {
 
         tokio::spawn(async move {
             if let Some(cfg) = tls_config {
-                tracing::info!("Starting HTTPS API on {addr}");
-                axum_server::bind_rustls(addr, cfg)
+                tracing::info!("Starting HTTPS API on {bind_address}");
+                axum_server::bind_rustls(bind_address, cfg)
                     .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                     .unwrap();
             } else {
-                tracing::info!("Starting HTTP API on {addr}");
-                let listener = tokio::net::TcpListener::bind(addr)
+                tracing::info!("Starting HTTP API on {bind_address}");
+                let listener = tokio::net::TcpListener::bind(bind_address)
                     .await
                     .unwrap_or_else(|e| {
-                        tracing::error!("Failed to bind to {addr}: {e}");
+                        tracing::error!("Failed to bind to {bind_address}: {e}");
                         std::process::exit(1);
                     });
                 axum::serve(

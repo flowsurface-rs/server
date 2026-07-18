@@ -9,6 +9,7 @@ use flowsurface_exchange::unit::{price::Price, qty::Qty};
 use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
 use crate::api::{AnnotatedTrade, TradeQuery};
+use crate::config::{RetentionHours, StorageBytes};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -93,7 +94,7 @@ impl Storage {
 
     /// Return the size (in bytes) of the main database file plus the
     /// WAL file.  If a file does not (yet) exist its size is counted as 0.
-    pub fn current_storage_bytes(&self) -> Result<u64> {
+    pub fn current_storage_bytes(&self) -> Result<StorageBytes> {
         let db_path = self.data_dir.join("trades.duckdb");
         let wal_path = self.data_dir.join("trades.duckdb.wal");
 
@@ -113,7 +114,7 @@ impl Storage {
             }
         };
 
-        Ok(db_size + wal_size)
+        Ok(StorageBytes::from_bytes(db_size + wal_size))
     }
 
     /// Return the total number of rows in the `trades` table.
@@ -473,9 +474,9 @@ impl Storage {
 
     /// Delete every trade row whose `ts` (milliseconds since epoch) is
     /// older than `retention_hours`.  Returns the number of deleted rows.
-    pub fn purge_old_trades(&self, retention_hours: u64) -> Result<u64> {
+    pub fn purge_old_trades(&self, retention_hours: RetentionHours) -> Result<u64> {
         let conn = self.connection()?;
-        let cutoff_ms = Self::now_ms() - (retention_hours as i64 * 3_600_000);
+        let cutoff_ms = Self::now_ms() - retention_hours.as_millis();
         let deleted = conn
             .execute(
                 "DELETE FROM trades WHERE ts < ?1",

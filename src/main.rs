@@ -6,6 +6,7 @@ mod ingestion;
 mod storage;
 mod tls;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use flowsurface_exchange::adapter::{AdapterHandles, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
-use crate::config::{Args, Config};
+use crate::config::{Args, BearerToken, Config};
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -56,8 +57,8 @@ struct App {
     adapter_handles: AdapterHandles,
     resolved_pairs: Vec<TickerInfo>,
     metadata_cache: discovery::MetadataCache,
-    bind_address: String,
-    auth_token: Option<String>,
+    bind_address: SocketAddr,
+    auth_token: Option<BearerToken>,
     flush_interval: std::time::Duration,
     max_buffered_trades: usize,
     cleanup_scheduler: cleanup::CleanupScheduler,
@@ -140,16 +141,12 @@ impl App {
         }
 
         // Only generate TLS cert for non-loopback addresses.
-        let addr: std::net::SocketAddr = config
-            .bind_address
-            .parse()
-            .expect("bind_address already validated");
-
-        let tls_config = if addr.ip().is_loopback() {
+        let tls_config = if config.bind_address.ip().is_loopback() {
             None
         } else {
             let tls_domain = config.tls_domain.clone();
-            let bind_ip = (!addr.ip().is_unspecified()).then_some(addr.ip());
+            let bind_ip =
+                (!config.bind_address.ip().is_unspecified()).then_some(config.bind_address.ip());
 
             let cert_path = data_dir.join("cert.pem");
             let key_path = data_dir.join("key.pem");
@@ -206,7 +203,7 @@ impl App {
             adapter_handles,
             resolved_pairs,
             metadata_cache,
-            bind_address: config.bind_address.clone(),
+            bind_address: config.bind_address,
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             max_buffered_trades: config.max_buffered_trades,
@@ -256,7 +253,7 @@ impl App {
             available_tickers,
             self.tls_config,
         ));
-        let server_handle = server.serve(&self.bind_address).await;
+        let server_handle = server.serve(self.bind_address).await;
 
         AppHandles {
             shutdown,
