@@ -80,7 +80,11 @@ impl App {
                     std::process::exit(1);
                 });
 
-        let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config);
+        let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config)
+            .unwrap_or_else(|e| {
+                tracing::error!("{e:#}");
+                std::process::exit(1);
+            });
 
         let whitelist = config.resolve_whitelist();
         if !config.discovery_mode && (whitelist.is_empty() || config.base_assets.is_empty()) {
@@ -216,13 +220,22 @@ impl App {
         let (trade_tx, trade_rx) = mpsc::unbounded_channel::<api::AnnotatedTrade>();
         let shutdown = CancellationToken::new();
 
+        let cleanup_last_run = tokio::task::spawn_blocking({
+            let scheduler = self.cleanup_scheduler.clone();
+            move || scheduler.run_pass()
+        })
+        .await
+        .unwrap_or(None);
+
         let flusher = self.storage.spawn_batch_flusher(
             trade_rx,
             self.flush_interval,
             self.max_buffered_trades,
         );
 
-        let _cleanup = self.cleanup_scheduler.spawn(shutdown.child_token());
+        let _cleanup = self
+            .cleanup_scheduler
+            .spawn(cleanup_last_run, shutdown.child_token());
 
         let ingest = ingestion::start_all_ingest_tasks(
             &self.resolved_pairs,

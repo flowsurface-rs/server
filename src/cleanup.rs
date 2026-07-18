@@ -22,6 +22,10 @@ const MAX_PURGE_ITERATIONS: usize = 200;
 /// size after `CHECKPOINT`.
 const EST_BYTES_PER_ROW: u64 = 50;
 
+/// Target fraction of the cap to purge down to, leaving headroom for
+/// incoming trades between periodic checks.  4/5 = 80 %.
+const HEADROOM_FRACTION: u64 = 4;
+
 /// Batch size for each purge iteration — ~10% of the cap, clamped to
 /// [1 000, 100 000].
 fn purge_batch_size(max_bytes: u64) -> i64 {
@@ -60,15 +64,20 @@ impl CleanupConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct CleanupScheduler {
     storage: Storage,
     config: CleanupConfig,
 }
 
 impl CleanupScheduler {
-    /// Create the scheduler and run the startup guard, which exits
-    /// the process if the database is > 2× the configured cap.
-    pub fn new(storage: &Storage, config: CleanupConfig) -> Self {
+    /// Create the scheduler and check the startup guard: if the database
+    /// is > 2× the configured cap the process exits (this is a
+    /// misconfiguration that would take too long to recover from at
+    /// startup).
+    ///
+    /// Returns an error when the storage size cannot be read at all.
+    pub fn new(storage: &Storage, config: CleanupConfig) -> anyhow::Result<Self> {
         if let Some(max) = config.max_storage_bytes {
             tracing::info!(
                 "Storage hard cap enabled: {} MB (will purge oldest trades when exceeded)",
@@ -77,7 +86,7 @@ impl CleanupScheduler {
 
             match storage.current_storage_bytes() {
                 Ok(current) if current > max.saturating_mul(2) => {
-                    tracing::error!(
+                    anyhow::bail!(
                         "Database is {} MB — more than 2x the configured \
                          max_storage_mb cap ({} MB).  Purging that much data \
                          at startup would take too long; this likely indicates \
@@ -88,7 +97,6 @@ impl CleanupScheduler {
                         max / (1024 * 1024),
                         (current / (1024 * 1024)).saturating_add(1),
                     );
-                    std::process::exit(1);
                 }
                 Ok(current) if current > max => {
                     tracing::warn!(
@@ -99,17 +107,16 @@ impl CleanupScheduler {
                     );
                 }
                 Err(e) => {
-                    tracing::error!("Failed to check storage size at startup: {e:#}");
-                    std::process::exit(1);
+                    anyhow::bail!("Failed to check storage size at startup: {e:#}");
                 }
                 _ => {}
             }
         }
 
-        Self {
+        Ok(Self {
             storage: storage.clone(),
             config,
-        }
+        })
     }
 
     /// Run one cleanup pass: time-based retention, optional size-cap
@@ -118,7 +125,7 @@ impl CleanupScheduler {
     /// Returns `Some(last_cleanup_ts)` on success, or `None` if the
     /// pass failed (e.g. time-based purge errored or recording the
     /// timestamp failed).
-    fn run_pass(&self) -> Option<i64> {
+    pub fn run_pass(&self) -> Option<i64> {
         let mut any_deleted = false;
         let mut time_cleanup_ok = false;
 
@@ -146,10 +153,8 @@ impl CleanupScheduler {
             }
         }
 
-        if any_deleted {
-            if let Err(e) = self.storage.run_checkpoint() {
-                tracing::warn!("Failed to checkpoint DuckDB WAL after cleanup: {e:#}");
-            }
+        if any_deleted && let Err(e) = self.storage.run_checkpoint() {
+            tracing::warn!("Failed to checkpoint DuckDB WAL after cleanup: {e:#}");
         }
 
         if time_cleanup_ok {
@@ -161,27 +166,26 @@ impl CleanupScheduler {
         None
     }
 
-    /// Check whether storage is at or below `max_bytes`, using a
-    /// two-tier test: a cheap row-count estimate first, falling back
-    /// to an authoritative file-size check (which requires a
-    /// `CHECKPOINT`) only when the estimate is borderline.
-    fn is_storage_under_cap(&self, max_bytes: u64, max_est_rows: u64) -> Result<bool> {
-        if self.storage.count_trades()? > max_est_rows {
-            return Ok(false);
-        }
-        self.storage.run_checkpoint()?;
-        Ok(self.storage.current_storage_bytes()? <= max_bytes)
-    }
-
-    /// Delete oldest trades until on-disk size ≤ `max_bytes`.
+    /// Delete oldest trades until on-disk size is estimated to be under the cap.
+    ///
+    /// To avoid per-iteration CHECKPOINT overhead we use a two-phase approach:
+    /// 1. **Row-count estimate loop** — delete batches until the estimated row
+    ///    count is below the headroom-adjusted threshold.  No CHECKPOINTs here.
+    /// 2. **CHECKPOINT once**, then verify the real file size.  If still over
+    ///    the absolute cap we log a warning — the next periodic pass will retry.
+    ///
+    /// Targets `HEADROOM_FRACTION / 5` of the cap so there is headroom for
+    /// incoming trades between 5-minute checks.
     fn purge_oldest_trades_until_below(&self, max_bytes: u64) -> Result<u64> {
-        let max_est_rows = max_bytes.saturating_div(EST_BYTES_PER_ROW);
-        let batch_size = purge_batch_size(max_bytes);
+        let target_bytes = max_bytes.saturating_mul(HEADROOM_FRACTION) / 5;
+        let max_est_rows = target_bytes.saturating_div(EST_BYTES_PER_ROW);
+        let batch_size = purge_batch_size(target_bytes);
         let mut total_deleted = 0u64;
         let mut converged = false;
 
         for _ in 0..MAX_PURGE_ITERATIONS {
-            if self.is_storage_under_cap(max_bytes, max_est_rows)? {
+            // Cheap row-count check (no CHECKPOINT needed).
+            if self.storage.count_trades()? <= max_est_rows {
                 converged = true;
                 break;
             }
@@ -198,16 +202,22 @@ impl CleanupScheduler {
             let remaining_rows = self.storage.count_trades()?;
 
             if converged {
-                let current_mb = self
-                    .storage
-                    .current_storage_bytes()
-                    .map(|b| b / (1024 * 1024))
-                    .unwrap_or(0);
-                tracing::info!(
-                    "Cleaned up {total_deleted} trade(s) to keep storage under cap \
-                     (max {} MB, now ~{current_mb} MB)",
-                    max_bytes / (1024 * 1024),
-                );
+                let current_bytes = self.storage.current_storage_bytes()?;
+                if current_bytes <= max_bytes {
+                    tracing::info!(
+                        "Cleaned up {total_deleted} trade(s) to keep storage under \
+                         {} MB cap (now ~{} MB)",
+                        max_bytes / (1024 * 1024),
+                        current_bytes / (1024 * 1024),
+                    );
+                } else {
+                    tracing::warn!(
+                        "Storage ({} MB) still exceeds {} MB cap after cleanup. \
+                         The next periodic pass will retry.",
+                        current_bytes / (1024 * 1024),
+                        max_bytes / (1024 * 1024),
+                    );
+                }
             } else {
                 tracing::warn!(
                     "Size-cap purge did not converge after \
@@ -236,21 +246,22 @@ impl CleanupScheduler {
         Ok(total_deleted)
     }
 
-    /// Spawn the startup cleanup and periodic background task.
-    pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
+    /// Spawn the periodic background cleanup task.
+    ///
+    /// A one-shot startup pass must have been run beforehand (via
+    /// [`run_startup_pass`](Self::run_startup_pass)) so that
+    /// `last_cleanup` is initialised.  The loop then computes the
+    /// next wake-up from `last_cleanup` and only polls when work
+    /// is actually due (or every `SIZE_CHECK_INTERVAL` when a size
+    /// cap is configured).
+    pub fn spawn(self, last_cleanup: Option<i64>, shutdown: CancellationToken) -> JoinHandle<()> {
         let storage = self.storage.clone();
         let config = self.config;
 
         let retention_ms = (config.retention_hours as i64) * 3_600_000;
 
         tokio::spawn(async move {
-            // Run startup cleanup pass on a blocking thread first.
-            let mut last_cleanup = tokio::task::spawn_blocking({
-                let storage = storage.clone();
-                move || CleanupScheduler { storage, config }.run_pass()
-            })
-            .await
-            .unwrap_or(None);
+            let mut last_cleanup = last_cleanup;
 
             loop {
                 let time_delay = Self::delay_until_next_cleanup(last_cleanup, retention_ms);
@@ -306,6 +317,6 @@ impl CleanupScheduler {
 
 /// Whether VACUUM is worth running after a purge — only when we've
 /// freed at least ~25% of the remaining data.
-fn should_vacuum(total_deleted: u64, remaining_rows: u64) -> bool {
+const fn should_vacuum(total_deleted: u64, remaining_rows: u64) -> bool {
     remaining_rows == 0 || total_deleted >= remaining_rows / 4
 }
