@@ -3,6 +3,7 @@ name = "flowsurface-server"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/akenshaw/fs-server"
 
 [dependencies]
 # HTTP / async runtime / concurrency
@@ -46,3 +47,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 # Error handling
 anyhow = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
