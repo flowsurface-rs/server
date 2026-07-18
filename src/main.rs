@@ -74,7 +74,11 @@ impl App {
         });
 
         let cleanup_config =
-            cleanup::CleanupConfig::from_config(config.data_retention_hours, config.max_storage_mb);
+            cleanup::CleanupConfig::from_config(config.data_retention_hours, config.max_storage_mb)
+                .unwrap_or_else(|e| {
+                    tracing::error!("Invalid cleanup configuration: {e:#}");
+                    std::process::exit(1);
+                });
 
         let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config);
 

@@ -145,11 +145,40 @@ impl Storage {
     /// prior `DELETE` operations.  `CHECKPOINT` alone only merges the
     /// WAL — it does not shrink the main file.  `VACUUM` is O(n) in
     /// remaining rows, so callers should gate it behind a threshold.
+    ///
+    /// `VACUUM` requires exclusive table access, so it can fail with a
+    /// transaction conflict if the batch flusher is mid-append.  This
+    /// method retries a few times with short sleeps — the flusher's
+    /// appender is only held open for a few milliseconds per flush, so
+    /// a brief wait is almost always enough.  Safe to call from a
+    /// blocking thread (which is where cleanup always runs).
     pub fn vacuum(&self) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute_batch("VACUUM;")
-            .context("vacuuming DuckDB database")?;
-        Ok(())
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+        let mut last_err = None;
+        for attempt in 0..MAX_RETRIES {
+            let conn = self.connection()?;
+            match conn.execute_batch("VACUUM;") {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < MAX_RETRIES {
+                        tracing::debug!(
+                            "VACUUM attempt {}/{} failed (likely batch flusher \
+                             holding appender); retrying in {RETRY_DELAY:?}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                        );
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            duckdb::Error::InvalidParameterName("VACUUM produced no error".into())
+        }))
+        .with_context(|| format!("vacuuming DuckDB database after {MAX_RETRIES} attempts"))
     }
 
     /// Merge the DuckDB WAL into the main database file, then truncate

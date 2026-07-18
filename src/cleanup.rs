@@ -62,14 +62,23 @@ pub struct CleanupConfig {
 impl CleanupConfig {
     /// Derive the config from the user-facing `max_storage_mb` setting.
     /// A value of `0` or `None` means no cap.
-    pub fn from_config(retention_hours: u64, max_storage_mb: Option<u64>) -> Self {
+    ///
+    /// Returns an error if `retention_hours` is zero, which would purge
+    /// all trades on every cleanup pass.
+    pub fn from_config(retention_hours: u64, max_storage_mb: Option<u64>) -> anyhow::Result<Self> {
+        if retention_hours == 0 {
+            anyhow::bail!(
+                "data_retention_hours must be > 0 (got 0) — \
+                 a zero retention period would purge all trades on every cleanup pass"
+            );
+        }
         let max_storage_bytes = max_storage_mb
             .filter(|&mb| mb > 0)
             .map(|mb| mb.saturating_mul(1024 * 1024));
-        Self {
+        Ok(Self {
             retention_hours,
             max_storage_bytes,
-        }
+        })
     }
 }
 
@@ -137,7 +146,7 @@ impl CleanupScheduler {
     /// Returns `Some(ts)` when the time-based purge succeeded and the
     /// `last_cleanup` timestamp was recorded, or `None` on failure.
     fn run_pass(&self) -> Option<i64> {
-        let mut cleaned_anything = false;
+        let mut time_purge_deleted = false;
         let mut time_cleanup_ok = false;
 
         match self.storage.purge_old_trades(self.config.retention_hours) {
@@ -148,7 +157,7 @@ impl CleanupScheduler {
                         "Cleaned up {n} trade(s) older than {}h",
                         self.config.retention_hours
                     );
-                    cleaned_anything = true;
+                    time_purge_deleted = true;
                 }
             }
             Err(e) => {
@@ -156,6 +165,7 @@ impl CleanupScheduler {
             }
         }
 
+        let size_cap_ran = self.config.max_storage_bytes.is_some();
         if let Some(max_bytes) = self.config.max_storage_bytes {
             match self.purge_oldest_trades_until_below(max_bytes) {
                 Ok(n) => {
@@ -170,7 +180,6 @@ impl CleanupScheduler {
                              (max {} MB, now ~{current_mb} MB)",
                             max_bytes / (1024 * 1024),
                         );
-                        cleaned_anything = true;
                     }
                 }
                 Err(e) => {
@@ -179,7 +188,10 @@ impl CleanupScheduler {
             }
         }
 
-        if cleaned_anything && let Err(e) = self.storage.run_checkpoint() {
+        if time_purge_deleted
+            && !size_cap_ran
+            && let Err(e) = self.storage.run_checkpoint()
+        {
             tracing::warn!("Failed to checkpoint DuckDB WAL after cleanup: {e:#}");
         }
 
@@ -359,10 +371,13 @@ impl CleanupScheduler {
     fn delay_until_next_cleanup(last_cleanup_ms: Option<i64>, retention_ms: i64) -> Duration {
         let now_ms = Self::now_ms();
 
-        let anchor_ms = last_cleanup_ms.unwrap_or_else(|| {
-            tracing::debug!("No last_cleanup recorded; anchoring at now");
-            now_ms
-        });
+        let Some(anchor_ms) = last_cleanup_ms else {
+            // No last_cleanup recorded — either this is the first run
+            // or the previous cleanup pass failed.  Return zero so the
+            // caller (which applies `MIN_CLEANUP_DELAY`) retries quickly
+            // rather than waiting a full retention period.
+            return Duration::ZERO;
+        };
 
         let next_ms = anchor_ms + retention_ms;
         if next_ms <= now_ms {
