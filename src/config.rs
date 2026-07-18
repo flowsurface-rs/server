@@ -30,6 +30,8 @@ pub struct Config {
     /// Socket address to bind the HTTP API (e.g. `127.0.0.1:8080`).
     pub bind_address: SocketAddr,
     /// Directory where the DuckDB database file will be stored.
+    /// Defaults to `"data"` (relative to the config file's directory).
+    #[serde(default = "default_data_dir")]
     pub data_dir: String,
     /// Optional bearer-token required on all API requests.
     /// Mandatory when `bind_address` is not a loopback address.
@@ -101,6 +103,10 @@ pub struct Config {
     /// Default: `4096` (4 GiB).
     #[serde(default = "default_max_storage_mb")]
     pub max_storage_mb: Option<u64>,
+}
+
+fn default_data_dir() -> String {
+    "data".to_string()
 }
 
 const fn default_flush_interval() -> u64 {
