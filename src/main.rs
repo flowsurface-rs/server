@@ -7,7 +7,7 @@ mod storage;
 mod tls;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -47,7 +47,16 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let app = App::new(&config).await;
+    let data_dir = if Path::new(&config.data_dir).is_relative() {
+        config_path
+            .parent()
+            .expect("config path has no parent")
+            .join(&config.data_dir)
+    } else {
+        PathBuf::from(&config.data_dir)
+    };
+
+    let app = App::new(&config, &data_dir).await;
     let handles = app.serve().await;
     handles.shutdown().await;
 }
@@ -67,9 +76,8 @@ struct App {
 
 impl App {
     /// Open storage, resolve configured pairs, persist ticker metadata.
-    async fn new(config: &Config) -> Self {
-        let data_dir = PathBuf::from(&config.data_dir);
-        let storage = Storage::open(&data_dir).unwrap_or_else(|e| {
+    async fn new(config: &Config, data_dir: &Path) -> Self {
+        let storage = Storage::open(data_dir).unwrap_or_else(|e| {
             tracing::error!("Failed to initialise storage: {e:#}");
             std::process::exit(1);
         });

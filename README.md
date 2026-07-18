@@ -19,7 +19,7 @@ cp config.example.toml config.toml
 2. **Run**
 
 ```bash
-# looks for `config.toml` next to the binary or in the current directory.
+# looks for `config.toml` next to the binary.
 ./flowsurface-server
 ```
 

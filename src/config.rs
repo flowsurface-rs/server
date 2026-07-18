@@ -155,16 +155,16 @@ impl Config {
     }
 
     /// Resolve the configuration file path.
+    ///
+    /// Defaults to next to the binary so the entire app is portable in
+    /// a single directory.
     pub fn resolve_path(override_path: Option<PathBuf>) -> PathBuf {
         if let Some(path) = override_path {
             return path;
         }
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(parent) = exe.parent()
-        {
-            let candidate = parent.join("config.toml");
-            if candidate.exists() {
-                return candidate;
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                return parent.join("config.toml");
             }
         }
         PathBuf::from("config.toml")

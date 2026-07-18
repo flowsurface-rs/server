@@ -1,5 +1,6 @@
 # Directory for DuckDB database, auth token, and TLS certs.
-# data_dir = "./data"
+# Relative paths are resolved from the config file's directory.
+# data_dir = "data"
 
 # ── Network ─────────────────────────────────────────────────────
 # Where the API listens.  Change to "0.0.0.0:8080" for remote
