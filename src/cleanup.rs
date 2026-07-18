@@ -25,9 +25,25 @@ const MAX_PURGE_ITERATIONS: usize = 200;
 /// size after `CHECKPOINT`.
 const EST_BYTES_PER_ROW: u64 = 50;
 
-/// Target fraction of the cap to purge down to, leaving headroom for
-/// incoming trades between periodic checks.  4/5 = 80 %.
-const HEADROOM_FRACTION: u64 = 4;
+/// On small-to-medium caps use a 20 % headroom so the purge leaves
+/// breathing room.  On very large caps the percentage would waste
+/// too much space, so we cap the absolute headroom at 10 GiB
+const MAX_HEADROOM: StorageBytes = StorageBytes::from_bytes(10 * 1024 * 1024 * 1024);
+
+/// Smallest sane target after headroom subtraction — prevents
+/// pathological behaviour on tiny caps.
+const MIN_TARGET: StorageBytes = StorageBytes::from_bytes(100 * 1024 * 1024);
+
+/// Compute the headroom to leave free below the cap.
+/// Returns `cap / 5` (20 %) but at most `MAX_HEADROOM`.
+fn purge_headroom(cap: StorageBytes) -> StorageBytes {
+    let pct = cap.as_bytes() / 5;
+    if pct > MAX_HEADROOM.as_bytes() {
+        MAX_HEADROOM
+    } else {
+        StorageBytes::from_bytes(pct)
+    }
+}
 
 /// Batch size for each purge iteration — ~10% of the cap, clamped to
 /// [1 000, 100 000].
@@ -172,11 +188,15 @@ impl CleanupScheduler {
     /// 2. **CHECKPOINT once**, then verify the real file size.  If still over
     ///    the absolute cap we log a warning — the next periodic pass will retry.
     ///
-    /// Targets `HEADROOM_FRACTION / 5` of the cap so there is headroom for
-    /// incoming trades between 5-minute checks.
+    /// Targets `cap - headroom` so there is breathing room for incoming
+    /// trades between 5-minute checks without wasting space on large caps.
     fn purge_oldest_trades_until_below(&self, max_bytes: StorageBytes) -> Result<u64> {
-        let target_bytes =
-            StorageBytes::from_bytes(max_bytes.as_bytes().saturating_mul(HEADROOM_FRACTION) / 5);
+        let headroom = purge_headroom(max_bytes);
+        let target_bytes = max_bytes
+            .as_bytes()
+            .saturating_sub(headroom.as_bytes())
+            .max(MIN_TARGET.as_bytes());
+        let target_bytes = StorageBytes::from_bytes(target_bytes);
         let max_est_rows = target_bytes.as_bytes().saturating_div(EST_BYTES_PER_ROW);
         let batch_size = purge_batch_size(target_bytes.as_bytes());
         let mut total_deleted = 0u64;

@@ -1,52 +1,59 @@
 # flowsurface-server
 
-A crypto trade data collector and server.
+A trade data collector for crypto markets, with an embedded database and REST API.
 
-Connects to crypto exchange WebSocket streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange),
-persists trades to an embedded [DuckDB](https://duckdb.org) database, and serves
-them over a REST API with optional Arrow IPC export.
+- Connects to exchange WebSocket streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange)
+- Persists trades to [DuckDB](https://duckdb.org)
+- Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
 ## Quick start
 
-```bash
-# 1. Copy the example config and edit to suit
-cp config.example.toml config.toml
-# edit config.toml to set your exchange whitelist, base assets, etc.
+1. **Copy the template**:
 
-# 2. Run
-./flowsurface-server                              # looks for config.toml next to binary or CWD
+```bash
+cp config.example.toml config.toml
+```
+
+> See the [basic settings](#basic) and edit `config.toml`
+
+2. **Run**
+
+```bash
+# looks for `config.toml` next to the binary or in the current directory.
+./flowsurface-server
+```
+
+Or to use a custom config path:
+
+```bash
 ./flowsurface-server --config /path/to/config.toml
 ```
 
 > If you run without a config file, the server will write the
-> template to the given path and **exit with code 2** — this is deliberate
-> so that systemd/supervisors can distinguish "not yet configured" from a
-> crash. Simply edit the generated file and re-run.
+> template to the given path and then exit. Simply edit the generated file and re-run.
 
 ## Configuration
 
-Full reference — see [`config.example.toml`](config.example.toml) for all
+See [`config.example.toml`](config.example.toml) for all
 available options with inline documentation.
 
-| Situation                         | Behaviour                                                                |
-| --------------------------------- | ------------------------------------------------------------------------ |
-| `bind_address = "127.0.0.1:8080"` | Plain HTTP, no auth required                                             |
-| `bind_address = "0.0.0.0:8080"`   | HTTPS (self-signed cert), auth token + cert fingerprint generated        |
-| `discovery_mode = true` (default) | Fetch metadata for **all** exchanges at startup to populate `/exchanges` |
-| `discovery_mode = false`          | Only fetch metadata for whitelisted venues                               |
+### Basic
 
-### Key settings
+| Option                 | Default | Description                                                                                             |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `bind_address`         | —       | Socket address to bind (`127.0.0.1:8080` = local-only plain HTTP; `0.0.0.0:8080` = remote HTTPS + auth) |
+| `base_assets`          | —       | Base assets expanded via whitelist templates (e.g. `["BTC", "ETH"]`)                                    |
+| `max_storage_mb`       | `4096`  | Hard cap on database file size (MB); `0` = unlimited.                                                   |
+| `data_retention_hours` | `168`   | Trades older than this are purged; `0` = keep all indefinitely.                                         |
 
-| Option                 | Default                | Description                                                                 |
-| ---------------------- | ---------------------- | --------------------------------------------------------------------------- |
-| `bind_address`         | —                      | Socket address to bind (e.g. `127.0.0.1:8080`)                              |
-| `data_dir`             | `"./data"`             | Directory for DuckDB, auth token, TLS certs/keys                            |
-| `base_assets`          | —                      | Base assets expanded via whitelist templates (e.g. `["BTC"]`)               |
-| `flush_interval_ms`    | `2000`                 | Batch flush interval (ms); lower = less data loss, higher = I/O efficient   |
-| `data_retention_hours` | `48`                   | Trades older than this are purged on startup & periodically                 |
-| `discovery_mode`       | `true`                 | Fetch metadata for all exchange variants so `/exchanges` is fully populated |
-| `max_buffered_trades`  | `200000`               | Max trades in memory buffer before dropping (OOM guard)                     |
-| `tls_domain`           | `"flowsurface-server"` | Domain in the self-signed TLS cert's SAN                                    |
+### Advanced
+
+| Option                | Default                | Description                                                                 |
+| --------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| `discovery_mode`      | `true`                 | Fetch metadata for all exchange variants so `/exchanges` is fully populated |
+| `tls_domain`          | `"flowsurface-server"` | Domain in the self-signed TLS cert's SAN (only needed for verified TLS)     |
+| `flush_interval_ms`   | `2000`                 | How often buffered trades are written to disk (ms); higher = fewer writes   |
+| `max_buffered_trades` | `200000`               | Max trades in memory buffer before dropping (OOM guard)                     |
 
 ### Whitelist templates
 
@@ -89,9 +96,8 @@ When binding to a **non-loopback** address, the server:
     cat data/.auth_token
     ```
 
-The token is reused across restarts. To set a specific token manually,
-add `auth_token = "your-token"` to `config.toml`, or set the
-`AUTH_TOKEN` environment variable (via `.env` or the environment).
+The token is reused across restarts. To set a specific token set the `AUTH_TOKEN` environment variable
+(via `.env` or the environment).
 
 ## Remote deployment (VPS)
 
@@ -141,13 +147,109 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 All other endpoints require `Authorization: Bearer <token>` when
 auth is configured.
 
-| Method | Path            | Auth     | Description                                                |
-| ------ | --------------- | -------- | ---------------------------------------------------------- |
-| GET    | `/status`       | ✗ public | Server uptime, DB connectivity check                       |
-| GET    | `/exchanges`    | required | Available ticker symbols per exchange                      |
-| GET    | `/pairs`        | required | Configured pairs with time bounds & tracked count          |
-| GET    | `/trades`       | required | Trade data (filtered by venue, symbol, time range)         |
-| GET    | `/trades.arrow` | required | Trade data as [Arrow IPC](https://arrow.apache.org) stream |
+| Method | Path            | Auth     | Description                                        |
+| ------ | --------------- | -------- | -------------------------------------------------- |
+| GET    | `/status`       | ✗ public | Server uptime, DB connectivity check               |
+| GET    | `/exchanges`    | required | Available ticker symbols per exchange              |
+| GET    | `/pairs`        | required | Configured pairs with time bounds & tracked count  |
+| GET    | `/trades`       | required | Trade data (filtered by venue, symbol, time range) |
+| GET    | `/trades.arrow` | required | Trade data as Arrow IPC stream                     |
+
+### GET /status
+
+Returns the server health status. No authentication required — suitable for
+load balancer health checks.
+
+#### Response fields
+
+| Field         | Type   | Description                   |
+| ------------- | ------ | ----------------------------- |
+| `status`      | string | Always `"ok"` while running   |
+| `uptime_secs` | int    | Seconds since server start    |
+| `db_ok`       | bool   | `true` if DuckDB is reachable |
+
+#### Example
+
+```bash
+curl http://127.0.0.1:8080/status
+```
+
+```json
+{
+    "status": "ok",
+    "uptime_secs": 7,
+    "db_ok": true
+}
+```
+
+### GET /exchanges
+
+Returns every ticker symbol discovered on each exchange, grouped by
+canonical exchange name. Useful for browsing available tickers before
+configuring the whitelist.
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  http://127.0.0.1:8080/exchanges
+```
+
+```json
+{
+    "exchanges": {
+        "Binance Linear": ["BTCUSDT", "ETHUSDT", ...],
+        "Binance Spot": ["BTCUSDT", "ETHUSDT", ...],
+        "Bybit Linear": ["BTCUSDT", ...],
+        ...
+    }
+}
+
+```
+
+### GET /pairs
+
+Returns all configured pairs with their stored time ranges. Pairs that have
+been configured but have not yet received any trades appear with `earliest`
+and `latest` as `null`.
+
+#### Response fields
+
+| Field           | Type  | Description                      |
+| --------------- | ----- | -------------------------------- |
+| `pairs`         | array | Array of tracked pair objects    |
+| `tracked_count` | int   | Total number of configured pairs |
+
+Each pair object:
+
+| Field      | Type   | Description                               |
+| ---------- | ------ | ----------------------------------------- |
+| `ticker`   | string | Ticker ID (`Exchange:pair`)               |
+| `earliest` | int    | Unix ms of oldest stored trade, or `null` |
+| `latest`   | int    | Unix ms of newest stored trade, or `null` |
+
+#### Example
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  http://127.0.0.1:8080/pairs
+```
+
+```json
+{
+    "pairs": [
+        {
+            "ticker": "BinanceSpot:btcusdt",
+            "earliest": 1783873393043,
+            "latest": 1784372262447
+        },
+        {
+            "ticker": "HyperliquidLinear:btcusdc",
+            "earliest": 1784372175005,
+            "latest": 1784372262010
+        }
+    ],
+    "tracked_count": 18
+}
+```
 
 ### GET /trades
 
@@ -207,8 +309,7 @@ format** payload (`Content-Type: application/vnd.apache.arrow.stream`)
 with 4 columns: `ts (int64)`, `price (float64)`, `qty (float64)`,
 `is_sell (bool)`.
 
-This is ideal for high-volume data transfer into data-science tools
-(Polars, Pandas, Julia, etc.) that support Arrow natively.
+This is ideal for high-volume data transfer to clients that support Arrow natively.
 
 | Param    | Type   | Description                                  |
 | -------- | ------ | -------------------------------------------- |
@@ -218,26 +319,3 @@ This is ideal for high-volume data transfer into data-science tools
 | `from`   | int    | Unix ms lower bound (inclusive)              |
 | `to`     | int    | Unix ms upper bound (inclusive)              |
 | `limit`  | int    | Max records (default 100 000, max 1 000 000) |
-
-### GET /exchanges
-
-Returns every ticker symbol discovered on each exchange, grouped by
-canonical exchange name. Useful for browsing available tickers before
-configuring the whitelist.
-
-```bash
-curl -H "Authorization: Bearer <token>" \
-  http://127.0.0.1:8080/exchanges
-```
-
-```json
-{
-    "exchanges": {
-        "Binance Linear": ["BTCUSDT", "ETHUSDT", ...],
-        "Binance Spot": ["BTCUSDT", "ETHUSDT", ...],
-        "Bybit Linear": ["BTCUSDT", ...],
-        ...
-    }
-}
-
-```

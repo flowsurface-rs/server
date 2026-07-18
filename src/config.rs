@@ -39,7 +39,8 @@ pub struct Config {
     ///
     /// When generated automatically the token is stored in
     /// `data_dir / .auth_token` so that restarts reuse the same token.
-    #[serde(default, skip_serializing)]
+    /// Not settable via `config.toml` — use the `AUTH_TOKEN` env var instead.
+    #[serde(skip)]
     pub auth_token: Option<BearerToken>,
 
     // ── Pair tracking ───────────────────────────────────────────
@@ -97,7 +98,8 @@ pub struct Config {
     ///
     /// Tip: set this to ~50-80 % of your available disk space so the
     /// server leaves room for system files, logs, and burst.
-    #[serde(default)]
+    /// Default: `4096` (4 GiB).
+    #[serde(default = "default_max_storage_mb")]
     pub max_storage_mb: Option<u64>,
 }
 
@@ -106,7 +108,7 @@ const fn default_flush_interval() -> u64 {
 }
 
 const fn default_data_retention_hours() -> u64 {
-    48
+    168
 }
 
 const fn default_true() -> bool {
@@ -119,6 +121,10 @@ fn default_tls_domain() -> String {
 
 const fn default_max_buffered_trades() -> usize {
     200_000
+}
+
+const fn default_max_storage_mb() -> Option<u64> {
+    Some(4096)
 }
 
 impl Config {
@@ -321,17 +327,15 @@ impl PartialEq for BearerToken {
     }
 }
 
-/// Retention period expressed in hours.  Guaranteed to be **> 0** —
-/// validated at construction via [`RetentionHours::new`].
+/// Retention period expressed in hours.  A value of `0` means
+/// **unlimited** — no time-based purges.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionHours(u64);
 
 impl RetentionHours {
-    /// Create a `RetentionHours`, returning an error if `hours == 0`.
+    /// Create a `RetentionHours`.  `0` is accepted and means unlimited
+    /// (time-based purges are skipped).
     pub fn new(hours: u64) -> anyhow::Result<Self> {
-        if hours == 0 {
-            anyhow::bail!("retention_hours must be > 0");
-        }
         Ok(Self(hours))
     }
 
@@ -363,7 +367,7 @@ impl StorageBytes {
     }
 
     /// The raw byte count.
-    pub fn as_bytes(self) -> u64 {
+    pub const fn as_bytes(self) -> u64 {
         self.0
     }
 

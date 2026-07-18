@@ -474,7 +474,13 @@ impl Storage {
 
     /// Delete every trade row whose `ts` (milliseconds since epoch) is
     /// older than `retention_hours`.  Returns the number of deleted rows.
+    ///
+    /// When `retention_hours` is `0` (unlimited) the purge is skipped
+    /// and `Ok(0)` is returned immediately.
     pub fn purge_old_trades(&self, retention_hours: RetentionHours) -> Result<u64> {
+        if retention_hours.as_hours() == 0 {
+            return Ok(0);
+        }
         let conn = self.connection()?;
         let cutoff_ms = Self::now_ms() - retention_hours.as_millis();
         let deleted = conn

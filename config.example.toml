@@ -1,52 +1,30 @@
+# Directory for DuckDB database, auth token, and TLS certs.
+# data_dir = "./data"
+
+# ── Network ─────────────────────────────────────────────────────
+# Where the API listens.  Change to "0.0.0.0:8080" for remote
+# access (auto-generates TLS cert + auth token).
 bind_address = "127.0.0.1:8080"
-data_dir = "./data"
 
-# Domain name for the self-signed TLS certificate's SAN (Subject Alternative Names).
-# Ignored on loopback binds (plain HTTP).  Default: "flowsurface-server".
-# tls_domain = "data.example.com"
-
-# Trade batch-flush interval in milliseconds.
-# Lower values reduce data loss on crash/failure; higher values are more I/O-efficient
-# (fewer fsyncs, larger columnar batches).  Default: 2000 (2 seconds).
-# flush_interval_ms = 2000
-
-# Maximum trades to buffer in memory before dropping to prevent OOM.
-# Tune based on your host RAM and risk tolerance:
-#   200k (~20-40 MB) — safe for 1 GB hosts
-#   1.2M (~120-240 MB) — ~2 min buffer at 10k trades/sec
-# Higher values reduce data-loss during DB outages but use more memory.
-# Default: 200000.
-# max_buffered_trades = 200000
-
-# Data retention period in hours.  Trades older than this will be purged
-# on startup (and periodically while running).  Default: 48 (2 days).
-# data_retention_hours = 48
-
+# ── Storage ──────────────────────────────────────────────────────
 # Hard cap on total DuckDB database file size in megabytes.
-# When the database file size exceeds this value the oldest trades are
-# purged during cleanup — even if they're within the time-based retention
-# window.  Use this to prevent the database from quietly filling your disk
-# on small VPS hosts.
-#
-# Tip: set to ~50-80 % of your available disk space to leave room for
-# system files, logs, and bursts.
-# Default: no cap.
-# max_storage_mb = 4096
+# When exceeded the oldest trades are purged during cleanup — even
+# if they're within the time-based retention window.
+# Set to 0 to disable the size cap.
+# Default: 4096 (4 GiB).
+max_storage_mb = 4096
 
-# Discovery mode: fetches and caches metadata for ALL supported exchanges on startup
-# so `/exchanges` is fully populated.  Lets you browse available tickers
-# before deciding what to track.  Default: true.
-# discovery_mode = true
+# Data retention period in hours.  Trades older than this are
+# purged on startup and periodically while running.
+# Set to 0 to keep all trades indefinitely (disk-permitting).
+# Default: 168 (7 days).
+data_retention_hours = 168
 
-# Base assets to track — expanded via the whitelist templates below.
-# The server fetches exchange metadata and resolves pairs at startup.
+# ── Pairs to track ──────────────────────────────────────────────
+# Expand base_assets × quote_assets from the whitelist templates
+# below.  The server resolves exchange-specific ticker strings
+# (handling separators, _PERP, -SWAP suffixes, etc.).
 base_assets = ["BTC", "ETH"]
-
-# Whitelist templates: per-venue, per-market-kind list of quote assets.
-# To exclude a venue entirely, omit it from the whitelist.
-# To exclude a market kind for a venue, omit that key.
-#
-# Use `[""]` (empty string) as a wildcard to track all `base_assets` regardless of the quote on that venue+market
 
 [whitelist.binance]
 spot = ["USDT"]
@@ -63,3 +41,27 @@ linear = ["USDC"]
 [whitelist.okex]
 spot = ["USDT"]
 linear = ["USDT"]
+
+# ── Advanced options ─────────────────────────────────────────────
+# Most users can leave these at their defaults.
+
+# Discovery mode: fetches metadata for ALL supported exchanges on
+# startup so /exchanges is fully populated.  
+# If false, only fetch metadata for whitelisted venues 
+# Default: true.
+# discovery_mode = true
+
+# Domain name for the self-signed TLS certificate's SAN.
+# Only needed when connecting via a domain with verified TLS.
+# tls_domain = "data.example.com"
+
+# Trade batch-flush interval in milliseconds.
+# Higher values = fewer disk writes (more I/O efficient).
+# Lower values = trades appear in the DB sooner (at the cost of more writes).
+# Default: 2000 (2 seconds).
+# flush_interval_ms = 2000
+
+# Maximum trades to buffer in memory before dropping (OOM guard).
+# 200k ≈ 20-40 MB — safe for 1 GB hosts.
+# Default: 200000.
+# max_buffered_trades = 200000
