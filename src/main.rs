@@ -179,7 +179,7 @@ impl App {
             }
 
             let tls_cert =
-                tls::load_or_generate(&data_dir, &tls_domain, bind_ip).unwrap_or_else(|e| {
+                tls::load_or_generate(data_dir, &tls_domain, bind_ip).unwrap_or_else(|e| {
                     tracing::error!("Failed to load/generate TLS certificate: {e:#}");
                     std::process::exit(1);
                 });

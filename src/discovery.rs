@@ -74,7 +74,7 @@ pub async fn build_metadata_cache(
                 continue;
             };
 
-            for (&market_kind, _) in markets {
+            for &market_kind in markets.keys() {
                 let market: MarketKind = market_kind.into();
 
                 let Some(exchange) = Exchange::from_venue_and_market(venue, market) else {

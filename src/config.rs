@@ -212,18 +212,40 @@ impl Config {
         self.whitelist.clone().unwrap_or_default()
     }
 
+    /// Project root directory, baked in at compile time.
+    ///
+    /// Used as the anchor when running via `cargo run` so that persistent
+    /// files land next to `Cargo.toml` rather than inside `target/`.
+    const CARGO_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
+
     /// Resolve the configuration file path.
     ///
-    /// Defaults to next to the binary so the entire app is portable in
-    /// a single directory.
+    /// - **Distributed binary**: defaults to next to the executable (portable).
+    /// - **`cargo run` / `cargo test`**: defaults to the project root
+    ///   (next to `Cargo.toml`), keeping persistent files out of `target/`.
+    /// - **Explicit `--config` flag**: always honoured.
     pub fn resolve_path(override_path: Option<PathBuf>) -> PathBuf {
         if let Some(path) = override_path {
             return path;
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                return parent.join("config.toml");
-            }
+
+        let running_via_cargo = std::env::var_os("CARGO").is_some()
+            || std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    p.to_str()
+                        .map(|s| s.contains("/target/") || s.contains("\\target\\"))
+                })
+                .unwrap_or(false);
+
+        if running_via_cargo {
+            return Path::new(Self::CARGO_MANIFEST_DIR).join("config.toml");
+        }
+
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            return parent.join("config.toml");
         }
         PathBuf::from("config.toml")
     }
