@@ -4,6 +4,15 @@
 # Default: 127.0.0.1:8080.
 bind_address = "127.0.0.1:8080"
 
+# Per-IP token-bucket rate limiter.  Each IP can burst up to
+# `max_requests` requests instantly; sustained throughput is
+# limited to `max_requests / 10` req/s (tokens refill continuously).
+# Set to 0 to disable entirely (not recommended if the API is
+# exposed to the internet — even for personal use a runaway
+# client can saturate the server).
+# Default: 500 req/10s per IP (burst 500, sustained ≈ 50 req/s).
+# max_requests = 500
+
 # Domain name for the self-signed TLS certificate's SAN.
 # Only needed when connecting via a domain with verified TLS.
 # Default: "flowsurface-server".

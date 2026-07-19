@@ -3,6 +3,7 @@ mod cleanup;
 mod config;
 mod discovery;
 mod ingestion;
+mod limiter;
 mod storage;
 mod tls;
 
@@ -21,6 +22,7 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
 use crate::config::{Args, BearerToken, Config};
+use crate::limiter::RateLimiter;
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -72,6 +74,7 @@ struct App {
     max_buffered_trades: usize,
     cleanup_scheduler: cleanup::CleanupScheduler,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl App {
@@ -213,6 +216,14 @@ impl App {
             )
         };
 
+        let rate_limiter = config.network.rate_limit_max().map(|max| {
+            tracing::info!(
+                "Rate limiting enabled: max {max} req/10s per IP (≈ {} req/s)",
+                max / 10
+            );
+            RateLimiter::new(max, std::time::Duration::from_secs(10))
+        });
+
         Self {
             storage,
             adapter_handles,
@@ -224,6 +235,7 @@ impl App {
             max_buffered_trades: config.storage.max_buffered_trades,
             tls_config,
             cleanup_scheduler,
+            rate_limiter,
         }
     }
 
@@ -267,6 +279,7 @@ impl App {
             configured_pairs,
             available_tickers,
             self.tls_config,
+            self.rate_limiter,
         ));
         let server_handle = server.serve(self.bind_address).await;
 

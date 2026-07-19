@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::BearerToken,
+    limiter::RateLimiter,
     storage::{PairInfo, Storage},
 };
 
@@ -113,6 +114,8 @@ pub struct Server {
     /// TLS configuration for the HTTPS server (self-signed).
     /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
     pub tls_config: Option<RustlsConfig>,
+    /// Per-IP rate limiter.  `None` when rate limiting is disabled.
+    pub rate_limiter: Option<RateLimiter>,
 }
 
 impl Server {
@@ -122,6 +125,7 @@ impl Server {
         configured_pairs: Vec<Ticker>,
         available_tickers: HashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
+        rate_limiter: Option<RateLimiter>,
     ) -> Self {
         Self {
             storage,
@@ -130,6 +134,7 @@ impl Server {
             configured_pairs,
             available_tickers,
             tls_config,
+            rate_limiter,
         }
     }
 
@@ -334,12 +339,18 @@ impl Server {
             .route("/status", get(Server::status))
             .with_state(self.clone());
 
-        // Protected routes — require Bearer token when auth is configured
+        // Protected routes — require Bearer token when auth is configured.
+        // Rate limiting is the outermost layer so abusive clients are dropped
+        // before we spend cycles verifying their token.
         let protected = Router::new()
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
             .route("/trades", get(Server::trades))
             .route("/trades.arrow", get(Server::trades_arrow))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                rate_limit_middleware,
+            ))
             .layer(axum::middleware::from_fn_with_state(
                 self.clone(),
                 auth_middleware,
@@ -376,6 +387,36 @@ impl Server {
             }
         })
     }
+}
+
+/// Static body for 429 responses
+static RATE_LIMIT_BODY: &str = r#"{"error":"rate limit exceeded, slow down"}"#;
+
+/// Axum middleware that enforces per-IP rate limits.
+/// Applied before auth so abusive clients are dropped without
+/// spending cycles on token verification.
+async fn rate_limit_middleware(
+    State(state): State<Arc<Server>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(ref limiter) = state.rate_limiter
+        && !limiter.check(peer_addr.ip())
+    {
+        tracing::warn!(
+            "Rate limit exceeded for {} on {}",
+            peer_addr.ip(),
+            req.uri().path(),
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::CONTENT_TYPE, "application/json")],
+            RATE_LIMIT_BODY,
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Thin axum middleware that delegates auth checking to `Server::check_auth`.

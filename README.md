@@ -6,6 +6,8 @@ A trade data collector for crypto markets, with an embedded database and REST AP
 - Persists trades to [DuckDB](https://duckdb.org)
 - Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
+It's lightweight and single-binary portable, designed to run on a small VPS for individual use; not for production nor shared-usage.
+
 ## Quick start
 
 1. **Copy the template**:
@@ -48,12 +50,13 @@ available options with inline documentation.
 
 ### Advanced
 
-| Option                | Default                | Description                                                                 |
-| --------------------- | ---------------------- | --------------------------------------------------------------------------- |
-| `discovery_mode`      | `true`                 | Fetch metadata for all exchange variants so `/exchanges` is fully populated |
-| `tls_domain`          | `"flowsurface-server"` | Domain in the self-signed TLS cert's SAN (only needed for verified TLS)     |
-| `flush_interval_ms`   | `2000`                 | How often buffered trades are written to disk (ms); higher = fewer writes   |
-| `max_buffered_trades` | `200000`               | Max trades in memory buffer before dropping (OOM guard)                     |
+| Option                | Default                | Description                                                                       |
+| --------------------- | ---------------------- | --------------------------------------------------------------------------------- |
+| `discovery_mode`      | `true`                 | Fetch metadata for all exchange variants so `/exchanges` is fully populated       |
+| `tls_domain`          | `"flowsurface-server"` | Domain in the self-signed TLS cert's SAN (only needed for verified TLS)           |
+| `flush_interval_ms`   | `2000`                 | How often buffered trades are written to disk (ms); higher = fewer writes         |
+| `max_buffered_trades` | `200000`               | Max trades in memory buffer before dropping (OOM guard)                           |
+| `max_requests`        | `500`                  | Per-IP rate limit (req/10s); `0` = disabled. Burst up to 500, sustained ~50 req/s |
 
 ### Whitelist templates
 

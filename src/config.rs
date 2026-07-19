@@ -69,7 +69,7 @@ pub struct Config {
     pub auth_token: Option<BearerToken>,
 }
 
-/// `[network]` section — bind address and TLS domain.
+/// `[network]` section — bind address, rate limiting, and TLS domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -77,6 +77,11 @@ pub struct NetworkConfig {
     /// Defaults to `127.0.0.1:8080`.
     #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
+    /// Per-IP token-bucket rate limit: max requests per 10-second window.
+    /// `0` disables rate limiting entirely (not recommended for internet-facing binds).
+    /// Default: `500` (burst 500, sustained ≈ 50 req/s).
+    #[serde(default = "default_rate_limit_max_requests")]
+    pub max_requests: u64,
     /// Domain name inserted into the self-signed TLS certificate's SAN.
     /// Default: `"flowsurface-server"`.
     #[serde(default = "default_tls_domain")]
@@ -87,7 +92,19 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
+            max_requests: default_rate_limit_max_requests(),
             tls_domain: default_tls_domain(),
+        }
+    }
+}
+
+impl NetworkConfig {
+    /// Returns the max requests per window, or `None` when disabled.
+    pub fn rate_limit_max(&self) -> Option<u64> {
+        if self.max_requests == 0 {
+            None
+        } else {
+            Some(self.max_requests)
         }
     }
 }
@@ -150,6 +167,10 @@ impl Default for PairsConfig {
             discovery_mode: default_true(),
         }
     }
+}
+
+const fn default_rate_limit_max_requests() -> u64 {
+    500
 }
 
 fn default_data_dir() -> String {
