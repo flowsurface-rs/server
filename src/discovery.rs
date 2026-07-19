@@ -74,17 +74,12 @@ pub async fn build_metadata_cache(
                 continue;
             };
 
-            for market_str in markets.keys() {
-                let Ok(market) = market_str.parse::<MarketKind>() else {
-                    tracing::warn!(
-                        "Unknown market kind '{market_str}' for venue {venue_str}, skipping"
-                    );
-                    continue;
-                };
+            for (&market_kind, _) in markets {
+                let market: MarketKind = market_kind.into();
 
                 let Some(exchange) = Exchange::from_venue_and_market(venue, market) else {
                     tracing::warn!(
-                        "Unsupported venue+market combination: {venue_str} {market_str}"
+                        "Unsupported venue+market combination: {venue_str} {market_kind}"
                     );
                     continue;
                 };
@@ -161,13 +156,11 @@ pub fn resolve_pairs(
         let base_upper = base.to_uppercase();
 
         for (venue_str, markets) in templates {
-            for (market_str, quotes) in markets {
+            for (&market_kind, quotes) in markets {
                 let Ok(venue) = venue_str.parse::<Venue>() else {
                     continue;
                 };
-                let Ok(market) = market_str.parse::<MarketKind>() else {
-                    continue;
-                };
+                let market: MarketKind = market_kind.into();
                 let Some(exchange) = Exchange::from_venue_and_market(venue, market) else {
                     continue;
                 };
@@ -233,7 +226,7 @@ pub fn resolve_pairs(
                         }
                         None => {
                             tracing::debug!(
-                                "Ticker not found on {venue_str} {market_str}: {candidate}"
+                                "Ticker not found on {venue_str} {market_kind}: {candidate}"
                             );
                         }
                     }

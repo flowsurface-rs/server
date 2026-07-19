@@ -63,14 +63,15 @@ pub struct CleanupConfig {
 }
 
 impl CleanupConfig {
-    /// Derive from user-facing settings.  `max_storage_mb` of `0` or
-    /// `None` disables the cap.  Returns an error if
-    /// `retention_hours` is zero.
-    pub fn from_config(retention_hours: u64, max_storage_mb: Option<u64>) -> anyhow::Result<Self> {
+    /// Derive from user-facing settings.  A `max_storage_mb` of `0`
+    /// disables the cap.  Returns an error if `retention_hours` is zero.
+    pub fn from_config(retention_hours: u64, max_storage_mb: u64) -> anyhow::Result<Self> {
         let retention_hours = RetentionHours::new(retention_hours)?;
-        let max_storage_bytes = max_storage_mb
-            .filter(|&mb| mb > 0)
-            .map(StorageBytes::from_mb);
+        let max_storage_bytes = if max_storage_mb > 0 {
+            Some(StorageBytes::from_mb(max_storage_mb))
+        } else {
+            None
+        };
         Ok(Self {
             retention_hours,
             max_storage_bytes,

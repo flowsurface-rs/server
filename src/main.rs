@@ -47,13 +47,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let data_dir = if Path::new(&config.data_dir).is_relative() {
+    let data_dir = if Path::new(&config.storage.data_dir).is_relative() {
         config_path
             .parent()
             .expect("config path has no parent")
-            .join(&config.data_dir)
+            .join(&config.storage.data_dir)
     } else {
-        PathBuf::from(&config.data_dir)
+        PathBuf::from(&config.storage.data_dir)
     };
 
     let app = App::new(&config, &data_dir).await;
@@ -82,12 +82,14 @@ impl App {
             std::process::exit(1);
         });
 
-        let cleanup_config =
-            cleanup::CleanupConfig::from_config(config.data_retention_hours, config.max_storage_mb)
-                .unwrap_or_else(|e| {
-                    tracing::error!("Invalid cleanup configuration: {e:#}");
-                    std::process::exit(1);
-                });
+        let cleanup_config = cleanup::CleanupConfig::from_config(
+            config.storage.data_retention_hours,
+            config.storage.max_storage_mb,
+        )
+        .unwrap_or_else(|e| {
+            tracing::error!("Invalid cleanup configuration: {e:#}");
+            std::process::exit(1);
+        });
 
         let cleanup_scheduler = cleanup::CleanupScheduler::new(&storage, cleanup_config)
             .unwrap_or_else(|e| {
@@ -96,12 +98,14 @@ impl App {
             });
 
         let whitelist = config.resolve_whitelist();
-        if !config.discovery_mode && (whitelist.is_empty() || config.base_assets.is_empty()) {
+        if !config.pairs.discovery_mode
+            && (whitelist.is_empty() || config.pairs.base_assets.is_empty())
+        {
             tracing::error!("No pairs configured. Set base_assets and whitelist in config.toml");
             std::process::exit(1);
         }
 
-        let venues: Vec<Venue> = if config.discovery_mode {
+        let venues: Vec<Venue> = if config.pairs.discovery_mode {
             Venue::ALL.to_vec()
         } else {
             discovery::venues_from_whitelist(&whitelist)
@@ -110,24 +114,27 @@ impl App {
         let adapter_handles = AdapterHandles::spawn_venues(venues, None);
 
         tracing::info!("Fetching ticker metadata from exchanges…");
-        let metadata_cache =
-            discovery::build_metadata_cache(&adapter_handles, &whitelist, config.discovery_mode)
-                .await;
+        let metadata_cache = discovery::build_metadata_cache(
+            &adapter_handles,
+            &whitelist,
+            config.pairs.discovery_mode,
+        )
+        .await;
 
         let resolved_pairs =
-            discovery::resolve_pairs(&config.base_assets, &whitelist, &metadata_cache);
+            discovery::resolve_pairs(&config.pairs.base_assets, &whitelist, &metadata_cache);
 
         if resolved_pairs.is_empty() {
-            if config.discovery_mode {
+            if config.pairs.discovery_mode {
                 tracing::warn!(
                     "No matching pairs for base_assets {:?} with current whitelist \
                      — discovery mode is on, so /exchanges is still populated.",
-                    config.base_assets
+                    config.pairs.base_assets
                 );
             } else {
                 tracing::error!(
                     "No matching pairs found for base_assets {:?} with current whitelist",
-                    config.base_assets
+                    config.pairs.base_assets
                 );
                 std::process::exit(1);
             }
@@ -149,12 +156,12 @@ impl App {
         }
 
         // Only generate TLS cert for non-loopback addresses.
-        let tls_config = if config.bind_address.ip().is_loopback() {
+        let tls_config = if config.network.bind_address.ip().is_loopback() {
             None
         } else {
-            let tls_domain = config.tls_domain.clone();
-            let bind_ip =
-                (!config.bind_address.ip().is_unspecified()).then_some(config.bind_address.ip());
+            let tls_domain = config.network.tls_domain.clone();
+            let bind_ip = (!config.network.bind_address.ip().is_unspecified())
+                .then_some(config.network.bind_address.ip());
 
             let cert_path = data_dir.join("cert.pem");
             let key_path = data_dir.join("key.pem");
@@ -211,10 +218,10 @@ impl App {
             adapter_handles,
             resolved_pairs,
             metadata_cache,
-            bind_address: config.bind_address,
+            bind_address: config.network.bind_address,
             auth_token: config.auth_token.clone(),
-            flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
-            max_buffered_trades: config.max_buffered_trades,
+            flush_interval: std::time::Duration::from_millis(config.storage.flush_interval_ms),
+            max_buffered_trades: config.storage.max_buffered_trades,
             tls_config,
             cleanup_scheduler,
         }

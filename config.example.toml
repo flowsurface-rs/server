@@ -1,18 +1,25 @@
-# Directory for DuckDB database, auth token, and TLS certs.
-# Relative paths are resolved from the config file's directory.
-data_dir = "data"
-
-# ── Network ─────────────────────────────────────────────────────
+[network]
 # Where the API listens.  Change to "0.0.0.0:8080" for remote
 # access (auto-generates TLS cert + auth token).
+# Default: 127.0.0.1:8080.
 bind_address = "127.0.0.1:8080"
 
-# ── Storage ──────────────────────────────────────────────────────
-# Hard cap on total DuckDB database file size in megabytes.
-# When exceeded the oldest trades are purged during cleanup — even
-# if they're within the time-based retention window.
-# Set to 0 to disable the size cap.
-# Default: 4096 (4 GiB).
+# Domain name for the self-signed TLS certificate's SAN.
+# Only needed when connecting via a domain with verified TLS.
+# Default: "flowsurface-server".
+# tls_domain = "data.example.com"
+
+[storage]
+# Directory for DuckDB database, auth token, and TLS certs.
+# Relative paths are resolved from the config file's directory.
+# Default: "data".
+data_dir = "data"
+
+# Hard cap on total DuckDB database file size.
+# When exceeded the oldest trades are purged during cleanup —
+# even if they're within the time-based retention window.
+# Set to 0 to disable the cap entirely.
+# Default: 4096 MiB (4 GiB).
 max_storage_mb = 4096
 
 # Data retention period in hours.  Trades older than this are
@@ -21,11 +28,33 @@ max_storage_mb = 4096
 # Default: 168 (7 days).
 data_retention_hours = 168
 
-# ── Pairs to track ──────────────────────────────────────────────
+# Trade batch-flush interval in milliseconds.
+# Higher values = fewer disk writes (more I/O efficient).
+# Lower values = trades appear in the DB sooner (at more write cost).
+# Default: 2000 (2 seconds).
+# flush_interval_ms = 2000
+
+# Maximum trades to buffer in memory before dropping (OOM guard).
+# 200k trades ≈ 20-40 MB — safe for hosts with 1 GB+ RAM.
+# Default: 200000.
+# max_buffered_trades = 200000
+
+[pairs]
 # Expand base_assets × quote_assets from the whitelist templates
 # below.  The server resolves exchange-specific ticker strings
 # (handling separators, _PERP, -SWAP suffixes, etc.).
+# Default: [] (no pairs tracked without whitelist).
 base_assets = ["BTC", "ETH"]
+
+# Discovery mode: fetches metadata for ALL supported exchanges on
+# startup so /exchanges is fully populated.
+# If false, only fetch metadata for whitelisted venues.
+# Default: true.
+# discovery_mode = true
+
+# ── Whitelist ───────────────────────────────────────────────────
+# Exchange-specific market tracking.  Each [whitelist.venue] section
+# lists market_kind = ["quote_assets"] pairs.
 
 [whitelist.binance]
 spot = ["USDT"]
@@ -42,27 +71,3 @@ linear = ["USDC"]
 [whitelist.okex]
 spot = ["USDT"]
 linear = ["USDT"]
-
-# ── Advanced options ─────────────────────────────────────────────
-# Most users can leave these at their defaults.
-
-# Discovery mode: fetches metadata for ALL supported exchanges on
-# startup so /exchanges is fully populated.  
-# If false, only fetch metadata for whitelisted venues 
-# Default: true.
-# discovery_mode = true
-
-# Domain name for the self-signed TLS certificate's SAN.
-# Only needed when connecting via a domain with verified TLS.
-# tls_domain = "data.example.com"
-
-# Trade batch-flush interval in milliseconds.
-# Higher values = fewer disk writes (more I/O efficient).
-# Lower values = trades appear in the DB sooner (at the cost of more writes).
-# Default: 2000 (2 seconds).
-# flush_interval_ms = 2000
-
-# Maximum trades to buffer in memory before dropping (OOM guard).
-# 200k ≈ 20-40 MB — safe for 1 GB hosts.
-# Default: 200000.
-# max_buffered_trades = 200000

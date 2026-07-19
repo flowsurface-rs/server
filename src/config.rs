@@ -4,17 +4,47 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use flowsurface_exchange::adapter::MarketKind;
 use serde::{Deserialize, Serialize};
 
 use std::fmt;
 use std::str::FromStr;
+
+/// Market kind as it appears in the whitelist config section.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigMarketKind {
+    Spot,
+    Linear,
+    Inverse,
+}
+
+impl From<ConfigMarketKind> for MarketKind {
+    fn from(k: ConfigMarketKind) -> Self {
+        match k {
+            ConfigMarketKind::Spot => MarketKind::Spot,
+            ConfigMarketKind::Linear => MarketKind::LinearPerps,
+            ConfigMarketKind::Inverse => MarketKind::InversePerps,
+        }
+    }
+}
+
+impl fmt::Display for ConfigMarketKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigMarketKind::Spot => write!(f, "spot"),
+            ConfigMarketKind::Linear => write!(f, "linear"),
+            ConfigMarketKind::Inverse => write!(f, "inverse"),
+        }
+    }
+}
 
 /// Whitelist templates: venue → market_kind → list of quote assets.
 ///
 /// For example `{"binance": {"spot": ["USDT"], "linear": ["USDT", "USDC"]}}`.
 /// The server constructs the correct ticker string per exchange
 /// (handling separators, _PERP, -SWAP suffixes, etc.).
-pub type WhitelistTemplates = HashMap<String, HashMap<String, Vec<String>>>;
+pub type WhitelistTemplates = HashMap<String, HashMap<ConfigMarketKind, Vec<String>>>;
 
 #[derive(Parser)]
 #[command(name = "flowsurface-server", about = "Trade data store daemon")]
@@ -27,86 +57,107 @@ pub struct Args {
 /// Top-level application configuration, mirroring `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub pairs: PairsConfig,
+    #[serde(default)]
+    pub whitelist: Option<WhitelistTemplates>,
+    #[serde(skip)]
+    pub auth_token: Option<BearerToken>,
+}
+
+/// `[network]` section — bind address and TLS domain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
     /// Socket address to bind the HTTP API (e.g. `127.0.0.1:8080`).
+    /// Defaults to `127.0.0.1:8080`.
+    #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
+    /// Domain name inserted into the self-signed TLS certificate's SAN.
+    /// Default: `"flowsurface-server"`.
+    #[serde(default = "default_tls_domain")]
+    pub tls_domain: String,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: default_bind_address(),
+            tls_domain: default_tls_domain(),
+        }
+    }
+}
+
+/// `[storage]` section — data directory, flush interval, retention, buffering caps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
     /// Directory where the DuckDB database file will be stored.
     /// Defaults to `"data"` (relative to the config file's directory).
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    /// Optional bearer-token required on all API requests.
-    /// Mandatory when `bind_address` is not a loopback address.
-    ///
-    /// The server uses HTTPS with a self-signed certificate (generated
-    /// on first boot), so the token is always encrypted in transit.
-    ///
-    /// When generated automatically the token is stored in
-    /// `data_dir / .auth_token` so that restarts reuse the same token.
-    /// Not settable via `config.toml` — use the `AUTH_TOKEN` env var instead.
-    #[serde(skip)]
-    pub auth_token: Option<BearerToken>,
-
-    // ── Pair tracking ───────────────────────────────────────────
-    /// Base assets to expand via the whitelist templates (e.g. `["btc", "eth"]`).
-    #[serde(default)]
-    pub base_assets: Vec<String>,
-
-    /// Whitelist templates (venue → market → suffixes).
-    #[serde(default)]
-    pub whitelist: Option<WhitelistTemplates>,
-
     /// Trade batch-flush interval in milliseconds.
-    /// Trades are buffered in memory and flushed to DuckDB in bulk
-    /// on this interval.  Lower values reduce data-loss on crash but
-    /// increase fsync pressure; higher values are more I/O-efficient.
     #[serde(default = "default_flush_interval")]
     pub flush_interval_ms: u64,
-
     /// Data retention period in hours.  Trades older than this are
     /// deleted on startup (and periodically while running).
     #[serde(default = "default_data_retention_hours")]
     pub data_retention_hours: u64,
-
-    /// When `true`, fetch metadata for **all** supported exchange variants
-    /// on startup so `/exchanges` is fully populated, regardless of the
-    /// whitelist.  Useful for discovering available tickers before deciding
-    /// what to track.  Default: `true`.
-    #[serde(default = "default_true")]
-    pub discovery_mode: bool,
-
-    /// Domain name inserted into the self-signed TLS certificate's SAN
-    /// (Subject Alternative Names).
-    ///
-    /// Ignored when `bind_address` is a loopback address (plain HTTP).
-    /// Default: `"flowsurface-server"`.
-    #[serde(default = "default_tls_domain")]
-    pub tls_domain: String,
-
-    /// Maximum number of trades to buffer in memory before dropping
-    /// incoming trades to prevent OOM on constrained hosts.
-    /// Trades are still received from the WebSocket (WS reader never
-    /// blocks), but once this ceiling is reached new trades are
-    /// silently dropped until the buffer is flushed to DuckDB.
-    /// Default: 200_000 (~20–40 MB depending on symbol length).
+    /// Maximum number of trades to buffer in memory before dropping.
     #[serde(default = "default_max_buffered_trades")]
     pub max_buffered_trades: usize,
-
-    /// Optional hard cap on total DuckDB storage (main DB + WAL) in
-    /// megabytes.  When the combined file size exceeds this value the
-    /// oldest trades are purged during cleanup — even if they're within
-    /// the time-based retention window.
-    ///
-    /// Use this to prevent the database from filling the disk on
-    /// constrained hosts.  Default: `None` (no size cap).
-    ///
-    /// Tip: set this to ~50-80 % of your available disk space so the
-    /// server leaves room for system files, logs, and burst.
+    /// Hard cap on total DuckDB storage in megabytes.
+    /// `0` disables the cap (no size-based purging).
     /// Default: `4096` (4 GiB).
     #[serde(default = "default_max_storage_mb")]
-    pub max_storage_mb: Option<u64>,
+    pub max_storage_mb: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_data_dir(),
+            flush_interval_ms: default_flush_interval(),
+            data_retention_hours: default_data_retention_hours(),
+            max_buffered_trades: default_max_buffered_trades(),
+            max_storage_mb: default_max_storage_mb(),
+        }
+    }
+}
+
+/// `[pairs]` section — base assets and discovery mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairsConfig {
+    /// Base assets to expand via the whitelist templates (e.g. `["btc", "eth"]`).
+    #[serde(default)]
+    pub base_assets: Vec<String>,
+    /// When `true`, fetch metadata for **all** supported exchange variants
+    /// on startup so `/exchanges` is fully populated, regardless of the
+    /// whitelist.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub discovery_mode: bool,
+}
+
+impl Default for PairsConfig {
+    fn default() -> Self {
+        Self {
+            base_assets: Vec::new(),
+            discovery_mode: default_true(),
+        }
+    }
 }
 
 fn default_data_dir() -> String {
     "data".to_string()
+}
+
+fn default_bind_address() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8080))
 }
 
 const fn default_flush_interval() -> u64 {
@@ -129,8 +180,8 @@ const fn default_max_buffered_trades() -> usize {
     200_000
 }
 
-const fn default_max_storage_mb() -> Option<u64> {
-    Some(4096)
+const fn default_max_storage_mb() -> u64 {
+    4096
 }
 
 impl Config {
@@ -143,6 +194,7 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+
         let mut cfg: Self =
             toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
@@ -177,11 +229,11 @@ impl Config {
     }
 
     pub fn resolve_auth_token(&mut self) -> anyhow::Result<()> {
-        if self.bind_address.ip().is_loopback() {
+        if self.network.bind_address.ip().is_loopback() {
             return Ok(());
         }
 
-        let token_file = std::path::PathBuf::from(&self.data_dir).join(".auth_token");
+        let token_file = std::path::PathBuf::from(&self.storage.data_dir).join(".auth_token");
         let on_disk_raw = std::fs::read_to_string(&token_file)
             .ok()
             .map(|s| s.trim().to_owned())
@@ -197,8 +249,8 @@ impl Config {
         };
 
         if on_disk_raw.as_deref() != Some(token.as_str()) {
-            std::fs::create_dir_all(&self.data_dir)
-                .with_context(|| format!("creating data dir '{}'", self.data_dir))?;
+            std::fs::create_dir_all(&self.storage.data_dir)
+                .with_context(|| format!("creating data dir '{}'", self.storage.data_dir))?;
             std::fs::write(&token_file, token.as_str())
                 .with_context(|| format!("writing {}", token_file.display()))?;
             crate::tls::restrict_permissions(&token_file);

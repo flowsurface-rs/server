@@ -32,7 +32,7 @@ arrow = { version = "58", default-features = false, features = ["ipc"] }
 # Serialization
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
 # CLI argument parsing
 clap = { version = "4", default-features = false, features = ["derive", "std"] }
