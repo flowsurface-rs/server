@@ -150,9 +150,9 @@ impl Server {
             .unwrap_or("");
 
         if !expected_token.is_valid_authorization(provided) {
-            let truncated: String = provided.chars().take(20).collect();
+            let token_len = provided.len();
             tracing::warn!(
-                "Auth failure from {}: expected valid Bearer token, got '{truncated}'",
+                "Auth failure from {}: expected valid Bearer token (received header of {token_len} bytes)",
                 peer_addr.ip(),
             );
             return Err((StatusCode::UNAUTHORIZED, "missing or invalid auth token"));
@@ -225,7 +225,10 @@ impl Server {
     async fn pairs(State(state): State<Arc<Self>>) -> impl IntoResponse {
         let db_pairs = match state.storage.pairs_with_bounds() {
             Ok(pairs) => pairs,
-            Err(e) => return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Err(e) => {
+                tracing::error!("Failed to query pairs: {e:#}");
+                return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
         };
 
         // Build a lookup keyed by "exchange:symbol" from DB results.
@@ -267,7 +270,10 @@ impl Server {
     async fn trades(State(state): State<Arc<Self>>, query: Query<TradeQuery>) -> impl IntoResponse {
         match state.storage.query_trades(&query) {
             Ok(trades) => Self::json_ok(&Response::Trades { trades }),
-            Err(e) => Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Err(e) => {
+                tracing::error!("Failed to query trades: {e:#}");
+                Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
         }
     }
 
@@ -294,10 +300,8 @@ impl Server {
         let arrow_bytes = match state.storage.query_trades_arrow_ipc(&bounded) {
             Ok(bytes) => bytes,
             Err(e) => {
-                return Server::json_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("arrow export: {e:#}"),
-                );
+                tracing::error!("Arrow export failed: {e:#}");
+                return Server::json_err(StatusCode::INTERNAL_SERVER_ERROR, "arrow export failed");
             }
         };
 
