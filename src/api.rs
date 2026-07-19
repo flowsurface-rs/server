@@ -163,12 +163,21 @@ impl Server {
 
     /// Build a JSON `200 OK` response from any serializable value.
     fn json_ok<T: Serialize>(data: &T) -> axum::response::Response {
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::to_string(data).unwrap(),
-        )
-            .into_response()
+        match serde_json::to_string(data) {
+            Ok(json) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("Failed to serialise response: {e:#}");
+                Self::json_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to serialise response",
+                )
+            }
+        }
     }
 
     /// Build a JSON error response with the given status code.
@@ -338,10 +347,12 @@ impl Server {
         tokio::spawn(async move {
             if let Some(cfg) = tls_config {
                 tracing::info!("Starting HTTPS API on {bind_address}");
-                axum_server::bind_rustls(bind_address, cfg)
+                if let Err(e) = axum_server::bind_rustls(bind_address, cfg)
                     .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
-                    .unwrap();
+                {
+                    tracing::error!("HTTPS server error on {bind_address}: {e:#}");
+                }
             } else {
                 tracing::info!("Starting HTTP API on {bind_address}");
                 let listener = tokio::net::TcpListener::bind(bind_address)
@@ -350,12 +361,14 @@ impl Server {
                         tracing::error!("Failed to bind to {bind_address}: {e}");
                         std::process::exit(1);
                     });
-                axum::serve(
+                if let Err(e) = axum::serve(
                     listener,
                     router.into_make_service_with_connect_info::<SocketAddr>(),
                 )
                 .await
-                .unwrap();
+                {
+                    tracing::error!("HTTP server error on {bind_address}: {e:#}");
+                }
             }
         })
     }

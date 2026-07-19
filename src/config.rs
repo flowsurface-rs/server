@@ -250,12 +250,12 @@ impl Config {
         PathBuf::from("config.toml")
     }
 
-    pub fn resolve_auth_token(&mut self) -> anyhow::Result<()> {
+    pub fn resolve_auth_token(&mut self, data_dir: &Path) -> anyhow::Result<()> {
         if self.network.bind_address.ip().is_loopback() {
             return Ok(());
         }
 
-        let token_file = std::path::PathBuf::from(&self.storage.data_dir).join(".auth_token");
+        let token_file = data_dir.join(".auth_token");
         let on_disk_raw = std::fs::read_to_string(&token_file)
             .ok()
             .map(|s| s.trim().to_owned())
@@ -271,8 +271,8 @@ impl Config {
         };
 
         if on_disk_raw.as_deref() != Some(token.as_str()) {
-            std::fs::create_dir_all(&self.storage.data_dir)
-                .with_context(|| format!("creating data dir '{}'", self.storage.data_dir))?;
+            std::fs::create_dir_all(data_dir)
+                .with_context(|| format!("creating data dir '{}'", data_dir.display()))?;
             std::fs::write(&token_file, token.as_str())
                 .with_context(|| format!("writing {}", token_file.display()))?;
             crate::tls::restrict_permissions(&token_file);

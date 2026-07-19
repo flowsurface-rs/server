@@ -42,11 +42,6 @@ async fn main() {
     let config_path = Config::resolve_path(args.config);
     let mut config = Config::load_or_write_template(&config_path);
 
-    if let Err(e) = config.resolve_auth_token() {
-        tracing::error!("{e:#}");
-        std::process::exit(1);
-    }
-
     let data_dir = if Path::new(&config.storage.data_dir).is_relative() {
         config_path
             .parent()
@@ -55,6 +50,11 @@ async fn main() {
     } else {
         PathBuf::from(&config.storage.data_dir)
     };
+
+    if let Err(e) = config.resolve_auth_token(&data_dir) {
+        tracing::error!("{e:#}");
+        std::process::exit(1);
+    }
 
     let app = App::new(&config, &data_dir).await;
     let handles = app.serve().await;
