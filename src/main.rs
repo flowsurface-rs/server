@@ -2,9 +2,9 @@ mod api;
 mod cleanup;
 mod config;
 mod discovery;
-mod ingestion;
 mod limiter;
 mod storage;
+mod stream;
 mod tls;
 
 use std::net::SocketAddr;
@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -239,10 +238,15 @@ impl App {
         }
     }
 
-    /// Start the pipeline (flusher, cleanup, ingest) and the HTTP server.
+    /// Start the pipeline (stream engine, flusher, cleanup) and the HTTP server.
     async fn serve(self) -> AppHandles {
-        let (trade_tx, trade_rx) = mpsc::unbounded_channel::<api::AnnotatedTrade>();
         let shutdown = CancellationToken::new();
+
+        let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
+            self.adapter_handles,
+            &self.resolved_pairs,
+            shutdown.child_token(),
+        );
 
         let cleanup_last_run = tokio::task::spawn_blocking({
             let scheduler = self.cleanup_scheduler.clone();
@@ -251,23 +255,15 @@ impl App {
         .await
         .unwrap_or(None);
 
-        let flusher = self.storage.spawn_batch_flusher(
-            trade_rx,
-            self.flush_interval,
-            self.max_buffered_trades,
-        );
-
         let _cleanup = self
             .cleanup_scheduler
             .spawn(cleanup_last_run, shutdown.child_token());
 
-        let ingest = ingestion::start_all_ingest_tasks(
-            &self.resolved_pairs,
-            self.adapter_handles,
-            trade_tx.clone(),
-            shutdown.child_token(),
-        )
-        .await;
+        let flusher = self.storage.spawn_batch_flusher(
+            &mut rx,
+            self.flush_interval,
+            self.max_buffered_trades,
+        );
 
         let configured_pairs: Vec<Ticker> =
             self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
@@ -285,10 +281,9 @@ impl App {
 
         AppHandles {
             shutdown,
-            _trade_tx: trade_tx,
+            stream_mgr: Some(stream_mgr),
             flusher,
             _cleanup,
-            ingest,
             _server: server_handle,
         }
     }
@@ -297,19 +292,18 @@ impl App {
 /// Runtime handles for the active pipeline — provides ordered shutdown.
 struct AppHandles {
     shutdown: CancellationToken,
-    _trade_tx: mpsc::UnboundedSender<api::AnnotatedTrade>,
+    stream_mgr: Option<stream::StreamManager>,
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
-    ingest: Vec<tokio::task::JoinHandle<()>>,
     _server: tokio::task::JoinHandle<()>,
 }
 
 impl AppHandles {
     const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Wait for SIGINT/SIGTERM, then drain in-flight trades
-    /// and join all background tasks within the grace period.
-    async fn shutdown(self) {
+    /// Wait for SIGINT/SIGTERM, then cancel all streams, drain in-flight
+    /// trades, and join every background task within the grace period.
+    async fn shutdown(mut self) {
         let mut sigint =
             signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
         let mut sigterm =
@@ -320,13 +314,23 @@ impl AppHandles {
         }
 
         tracing::info!("Shutting down…");
-        self.shutdown.cancel();
-        drop(self._trade_tx); // drop the extra sender so the flusher can drain
 
+        // 1. Cancel all stream tasks (they share the root token).
+        self.shutdown.cancel();
+
+        // 2. Drop persist sender so downstream consumers drain.
+        if let Some(ref mut mgr) = self.stream_mgr {
+            mgr.drop_persist_sender();
+        }
+
+        // 3. Join everything within the grace period.
         tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
+            // Flusher first — it drains the trade buffer to disk.
             let _ = self.flusher.await;
-            for h in self.ingest {
-                let _ = h.await;
+
+            // Streaming tasks (engine + handler).
+            if let Some(mgr) = self.stream_mgr.take() {
+                mgr.shutdown().await;
             }
         })
         .await
