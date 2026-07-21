@@ -6,7 +6,7 @@ A trade data collector for crypto markets, with an embedded database and REST AP
 - Persists trades to [DuckDB](https://duckdb.org)
 - Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
-It's lightweight and single-binary portable, designed to run on a small VPS for individual use; not for production nor shared-usage.
+It's self-contained, single-binary portable, designed to run on a small VPS for individual use; not for production or shared use.
 
 ## Quick start
 

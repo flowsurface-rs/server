@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+use rcgen::{CertificateParams, IsCa, KeyPair, SanType};
 use sha2::{Digest, Sha256};
 
 use crate::storage::Storage;
@@ -56,7 +56,7 @@ impl SelfSignedCert {
         let key_pair = KeyPair::generate().context("generating ECDSA P-256 key pair")?;
         let mut params = CertificateParams::new(vec![domain.to_string()])
             .context("creating certificate parameters")?;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.is_ca = IsCa::NoCa;
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, domain);

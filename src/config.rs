@@ -56,6 +56,7 @@ pub struct Args {
 
 /// Top-level application configuration, mirroring `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
