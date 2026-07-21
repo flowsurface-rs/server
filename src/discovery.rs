@@ -7,37 +7,33 @@ use crate::config::WhitelistTemplates;
 
 pub type MetadataCache = HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>;
 
-/// Flatten the metadata cache into a map of exchange → available ticker symbols.
+/// Orchestrate the full pair discovery pipeline: determine which venues to
+/// use based on discovery mode, spawn adapter handles, fetch ticker metadata
+/// from exchanges, and resolve concrete pair infos from the whitelist.
 ///
-/// Uses the display symbol when available (e.g. `"PURR/USDC"` instead of
-/// Hyperliquid's opaque internal ID `"@107"`).
-///
-/// Returns symbols in UPPERCASE for consistent display in the `/exchanges` API.
-pub fn tickers_per_exchange(cache: &MetadataCache) -> HashMap<String, Vec<String>> {
-    cache
-        .iter()
-        .map(|(exchange, tickers)| {
-            let mut symbols: Vec<String> = tickers
-                .keys()
-                .map(|t| {
-                    t.display_symbol()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| t.to_string())
-                        .to_uppercase()
-                })
-                .collect();
-            symbols.sort();
-            (exchange.to_string(), symbols)
-        })
-        .collect()
-}
+/// Returns the adapter handles, the metadata cache, and the resolved pairs.
+pub async fn setup_pairs(
+    base_assets: &[String],
+    discovery_mode: bool,
+    whitelist: &WhitelistTemplates,
+) -> (AdapterHandles, MetadataCache, Vec<TickerInfo>) {
+    let venues: Vec<Venue> = if discovery_mode {
+        Venue::ALL.to_vec()
+    } else {
+        whitelist
+            .keys()
+            .filter_map(|v| v.parse::<Venue>().ok())
+            .collect()
+    };
+    tracing::info!("Spawning venue adapters: {venues:?}");
+    let adapter_handles = AdapterHandles::spawn_venues(venues, None);
 
-/// Collect the set of venues needed from the whitelist templates.
-pub fn venues_from_whitelist(templates: &WhitelistTemplates) -> Vec<Venue> {
-    templates
-        .keys()
-        .filter_map(|v| v.parse::<Venue>().ok())
-        .collect()
+    tracing::info!("Fetching ticker metadata from exchanges…");
+    let metadata_cache = build_metadata_cache(&adapter_handles, whitelist, discovery_mode).await;
+
+    let resolved_pairs = resolve_pairs(base_assets, whitelist, &metadata_cache);
+
+    (adapter_handles, metadata_cache, resolved_pairs)
 }
 
 /// Fetch metadata for exchanges and return a cache.
@@ -45,7 +41,7 @@ pub fn venues_from_whitelist(templates: &WhitelistTemplates) -> Vec<Venue> {
 /// When `discovery_mode` is `true`, this ignores the whitelist templates
 /// and fetches metadata for **all** supported exchange variants, so that
 /// `/exchanges` is fully populated for discovery purposes.
-pub async fn build_metadata_cache(
+async fn build_metadata_cache(
     handles: &AdapterHandles,
     templates: &WhitelistTemplates,
     discovery_mode: bool,
@@ -100,6 +96,31 @@ pub async fn build_metadata_cache(
     cache
 }
 
+/// Flatten the metadata cache into a map of exchange → available ticker symbols.
+///
+/// Uses the display symbol when available (e.g. `"PURR/USDC"` instead of
+/// Hyperliquid's opaque internal ID `"@107"`).
+///
+/// Returns symbols in UPPERCASE for consistent display in the `/exchanges` API.
+pub fn tickers_per_exchange(cache: &MetadataCache) -> HashMap<String, Vec<String>> {
+    cache
+        .iter()
+        .map(|(exchange, tickers)| {
+            let mut symbols: Vec<String> = tickers
+                .keys()
+                .map(|t| {
+                    t.display_symbol()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| t.to_string())
+                        .to_uppercase()
+                })
+                .collect();
+            symbols.sort();
+            (exchange.to_string(), symbols)
+        })
+        .collect()
+}
+
 /// Generate the canonical ticker string for a given base asset, quote asset,
 /// and exchange, based on the exchange's known ticker format.
 ///
@@ -144,7 +165,7 @@ fn format_ticker(base: &str, quote: &str, exchange: Exchange) -> String {
 /// The whitelist provides **quote assets** per venue+market; this function
 /// constructs the correct ticker string per exchange using [`format_ticker`]
 /// and looks it up in the pre-fetched metadata cache.
-pub fn resolve_pairs(
+fn resolve_pairs(
     base_assets: &[String],
     templates: &WhitelistTemplates,
     cache: &MetadataCache,
