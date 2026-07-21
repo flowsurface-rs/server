@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use duckdb::{Appender, Connection};
+use duckdb::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use crate::config::{RetentionHours, StorageBytes};
 use crate::stream;
 use tokio::task::JoinHandle;
 
-/// Information about a tracked pair with the timestamp range stored.
+/// Tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PairInfo {
     pub ticker: Ticker,
@@ -50,10 +50,6 @@ impl Storage {
 
         let db_path = data_dir.join("trades.duckdb");
 
-        // Open the *first* connection – this creates the underlying
-        // duckdb_database handle.  All later connections MUST use
-        // try_clone() on this root connection to share the same
-        // database instance (and thus the same WAL / buffer pool).
         let root = Connection::open(&db_path)
             .with_context(|| format!("opening DuckDB at {}", db_path.display()))?;
 
@@ -118,9 +114,6 @@ impl Storage {
     }
 
     /// Return the total number of rows in the `trades` table.
-    ///
-    /// In DuckDB this is a cheap metadata operation on row-group
-    /// headers — safe to call frequently.
     pub fn count_trades(&self) -> Result<u64> {
         let conn = self.connection()?;
         conn.query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
@@ -151,19 +144,18 @@ impl Storage {
     /// transaction conflict if the batch flusher is mid-append.  This
     /// method retries a few times with short sleeps — the flusher's
     /// appender is only held open for a few milliseconds per flush, so
-    /// a brief wait is almost always enough.  Safe to call from a
-    /// blocking thread (which is where cleanup always runs).
+    /// a brief wait is almost always enough.
     pub fn vacuum(&self) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-        let mut last_err = None;
+        let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..MAX_RETRIES {
             let conn = self.connection()?;
             match conn.execute_batch("VACUUM;") {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    last_err = Some(e);
+                    last_err = Some(anyhow::Error::new(e));
                     if attempt + 1 < MAX_RETRIES {
                         tracing::debug!(
                             "VACUUM attempt {}/{} failed (likely batch flusher \
@@ -176,9 +168,13 @@ impl Storage {
                 }
             }
         }
-        // SAFETY: the loop always sets `last_err` before reaching this point.
-        Err(last_err.unwrap())
-            .with_context(|| format!("vacuuming DuckDB database after {MAX_RETRIES} attempts"))
+        // last_err is always Some when MAX_RETRIES > 0 and the loop reaches
+        // this point; the unwrap_or_else branch covers the edge case where
+        // MAX_RETRIES is zero (the loop body never executes).
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("VACUUM never attempted (MAX_RETRIES = {MAX_RETRIES})")
+        }))
+        .with_context(|| format!("vacuuming DuckDB database after {MAX_RETRIES} attempts"))
     }
 
     /// Merge the DuckDB WAL into the main database file, then truncate
@@ -210,14 +206,12 @@ impl Storage {
             .context("cloning root connection for query")
     }
 
-    /// Query trades matching the given filter.
     pub fn query_trades(&self, q: &TradeQuery) -> Result<Vec<AnnotatedTrade>> {
         let conn = self.connection()?;
 
         let limit = q.limit.unwrap_or(1000).min(10_000);
         let exchange = q.exchange_filter();
 
-        // Build the SQL with positional ? placeholders.
         let mut sql = String::from(
             "SELECT exchange, symbol, ts, price, qty, is_sell
              FROM trades
@@ -273,8 +267,6 @@ impl Storage {
         Ok(trades)
     }
 
-    /// Export matching trades as an **Arrow IPC stream**.
-    ///
     /// Returns the complete Arrow IPC streaming format payload suitable
     /// for HTTP response with `Content-Type: application/vnd.apache.arrow.stream`.
     pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
@@ -503,7 +495,7 @@ impl Storage {
     /// data type to its DuckDB table.
     ///
     /// - `TradesReceived` → buffered and flushed via `Appender` API.
-    /// - `DepthReceived` / `KlineReceived` → logged (future tables).
+    /// - `DepthReceived` → logged (future tables).
     pub fn spawn_batch_flusher(
         &self,
         rx: &mut stream::StreamReceivers,
@@ -523,22 +515,25 @@ impl Storage {
             interval.reset_immediately();
 
             loop {
-                // Check if an in-flight blocking flush has finished.
-                if let Some(ref h) = flush_handle
-                    && h.is_finished()
-                {
-                    let handle = flush_handle.take().unwrap();
-                    match handle.await {
-                        Ok(Ok(())) => flusher.flush_succeeded(),
-                        Ok(Err(e)) => {
-                            tracing::error!(
-                                "Batch flush failed ({} trades in new buffer, \
-                                 failed batch dropped): {e:#}",
-                                flusher.pending_count()
+                if flush_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                    match flush_handle.take() {
+                        Some(handle) => match handle.await {
+                            Ok(Ok(())) => flusher.flush_succeeded(),
+                            Ok(Err(e)) => {
+                                tracing::error!(
+                                    "Batch flush failed ({} trades in new buffer, \
+                                         failed batch dropped): {e:#}",
+                                    flusher.pending_count()
+                                );
+                            }
+                            Err(_) => {
+                                tracing::error!("Batch flush task panicked or cancelled");
+                            }
+                        },
+                        None => {
+                            tracing::warn!(
+                                "Flush handle was unexpectedly None after is_finished check"
                             );
-                        }
-                        Err(_) => {
-                            tracing::error!("Batch flush task panicked or cancelled");
                         }
                     }
                 }
@@ -607,7 +602,7 @@ enum PersistableData {
 /// concern of "does this event get persisted?" from *how* it's buffered.
 ///
 /// Events that don't need persistence (depth, kline, connect/disconnect)
-/// are logged or ignored — no buffer overhead.
+/// are logged or ignored.
 struct BatchFlusher {
     buf: DataBuffer,
 }
@@ -651,7 +646,6 @@ impl BatchFlusher {
         self.buf.len()
     }
 
-    /// Drain all buffered data for a blocking flush.
     fn take_all(&mut self) -> Vec<PersistableData> {
         self.buf.take()
     }
@@ -728,18 +722,15 @@ impl BatchWriter {
             return Ok(());
         }
 
-        // Lazy appender — only opened if we have trades to write.
-        let mut trade_appender: Option<Appender<'_>> = None;
+        let mut trade_appender = self
+            .conn
+            .appender("trades")
+            .context("creating DuckDB appender for trades")?;
 
         for item in items {
             match item {
                 PersistableData::Trade(t) => {
-                    let appender = trade_appender.get_or_insert_with(|| {
-                        self.conn
-                            .appender("trades")
-                            .expect("creating DuckDB appender for trades")
-                    });
-                    appender
+                    trade_appender
                         .append_row((
                             &t.ticker.exchange.to_string(),
                             &t.ticker
@@ -756,9 +747,9 @@ impl BatchWriter {
             }
         }
 
-        if let Some(mut appender) = trade_appender {
-            appender.flush().context("flushing DuckDB trade appender")?;
-        }
+        trade_appender
+            .flush()
+            .context("flushing DuckDB trade appender")?;
 
         Ok(())
     }

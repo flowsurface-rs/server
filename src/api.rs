@@ -392,12 +392,16 @@ impl Server {
                 }
             } else {
                 tracing::info!("Starting HTTP API on {bind_address}");
-                let listener = tokio::net::TcpListener::bind(bind_address)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Failed to bind to {bind_address}: {e}");
-                        std::process::exit(1);
-                    });
+                let listener = match tokio::net::TcpListener::bind(bind_address).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to bind to {bind_address}: {e:#}. \
+                             Server will not accept connections."
+                        );
+                        return;
+                    }
+                };
                 if let Err(e) = axum::serve(
                     listener,
                     router.into_make_service_with_connect_info::<SocketAddr>(),

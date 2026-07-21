@@ -131,7 +131,37 @@ impl StreamManager {
         }
 
         // Low-level per-exchange WebSocket tasks.
-        let (event_rx, stream_tasks) = spawn(handles, all_streams, shutdown.child_token());
+        let (event_rx, stream_tasks) = {
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+            let mut by_exchange: HashMap<Exchange, Vec<StreamKind>> = HashMap::new();
+            for stream in &all_streams {
+                let exchange = stream.ticker_info().exchange();
+                by_exchange.entry(exchange).or_default().push(*stream);
+            }
+
+            let mut tasks = Vec::new();
+            for (exchange, exchange_streams) in by_exchange {
+                let tx = event_tx.clone();
+                let shutdown = shutdown.child_token();
+                let handles = handles.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    if let Err(e) =
+                        run_exchange_streams(handles, exchange, exchange_streams, tx, shutdown)
+                            .await
+                    {
+                        tracing::error!("Stream engine for {exchange} exited: {e:#}");
+                    }
+                }));
+            }
+
+            // Drop the original sender so all clones live inside the tasks.
+            // When the tasks finish (on cancellation) the receiver gets None.
+            drop(event_tx);
+
+            (event_rx, tasks)
+        };
 
         let outlets = EventOutlets::new()
             .with_persist(persist_tx)
@@ -158,14 +188,12 @@ impl StreamManager {
         self.outlets.persist.take();
     }
 
-    /// Return a new broadcast receiver for downstream consumers.
+    /// Return a new broadcast receiver for downstream consumers, or
+    /// `None` if the broadcast channel hasn't been initialised yet
+    /// (which should not happen after `start_streams`).
     #[allow(dead_code)]
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.outlets
-            .broadcast
-            .as_ref()
-            .expect("StreamManager always has broadcast set")
-            .subscribe()
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<Event>> {
+        self.outlets.broadcast.as_ref().map(|tx| tx.subscribe())
     }
 
     /// Join all streaming tasks.  The caller must have cancelled the
@@ -179,49 +207,6 @@ impl StreamManager {
         }
         // outlets (and all its senders) are dropped here.
     }
-}
-
-/// Spawn per-exchange stream tasks for every provided [`StreamKind`].
-///
-/// Each exchange gets one task that subscribes to **all** requested stream
-/// kinds (trades, depth, kline) for its tickers, merges the [`BoxStream`]s
-/// with `select_all`, and forwards every [`Event`] into a unified channel.
-fn spawn(
-    handles: AdapterHandles,
-    streams: Vec<StreamKind>,
-    shutdown: CancellationToken,
-) -> (
-    mpsc::UnboundedReceiver<Event>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-    let mut by_exchange: HashMap<Exchange, Vec<StreamKind>> = HashMap::new();
-    for stream in &streams {
-        let exchange = stream.ticker_info().exchange();
-        by_exchange.entry(exchange).or_default().push(*stream);
-    }
-
-    let mut tasks = Vec::new();
-    for (exchange, exchange_streams) in by_exchange {
-        let tx = event_tx.clone();
-        let shutdown = shutdown.child_token();
-        let handles = handles.clone();
-
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) =
-                run_exchange_streams(handles, exchange, exchange_streams, tx, shutdown).await
-            {
-                tracing::error!("Stream engine for {exchange} exited: {e:#}");
-            }
-        }));
-    }
-
-    // Drop the original sender so all clones live inside the tasks.
-    // When the tasks finish (on cancellation) the receiver gets None.
-    drop(event_tx);
-
-    (event_rx, tasks)
 }
 
 /// Subscribe to **all** stream kinds for a single `exchange` and forward

@@ -160,8 +160,7 @@ auth is configured.
 
 ### GET /status
 
-Returns the server health status. No authentication required — suitable for
-load balancer health checks.
+Returns the server health status. No authentication required.
 
 #### Response fields
 
