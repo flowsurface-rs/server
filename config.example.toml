@@ -1,5 +1,5 @@
 [network]
-# Where the API listens.  Change to "0.0.0.0:8080" for remote
+# Where the API listens.  Change to any non-loopback address for remote
 # access (auto-generates TLS cert + auth token).
 # Default: 127.0.0.1:8080.
 bind_address = "127.0.0.1:8080"
@@ -24,7 +24,7 @@ bind_address = "127.0.0.1:8080"
 # Default: "data".
 data_dir = "data"
 
-# Hard cap on total DuckDB database file size.
+# Hard cap on total DuckDB storage (database + WAL).
 # When exceeded the oldest trades are purged during cleanup —
 # even if they're within the time-based retention window.
 # Set to 0 to disable the cap entirely.
@@ -52,7 +52,9 @@ data_retention_hours = 168
 # Expand base_assets × quote_assets from the whitelist templates
 # below.  The server resolves exchange-specific ticker strings
 # (handling separators, _PERP, -SWAP suffixes, etc.).
-# Default: [] (no pairs tracked without whitelist).
+# Pairs are only tracked when BOTH a base asset AND a matching
+# whitelist entry exist.
+# Default: [] (no pairs tracked).
 base_assets = ["BTC", "ETH"]
 
 # Discovery mode: fetches metadata for ALL supported exchanges on
@@ -64,6 +66,9 @@ base_assets = ["BTC", "ETH"]
 # ── Whitelist ───────────────────────────────────────────────────
 # Exchange-specific market tracking.  Each [whitelist.venue] section
 # lists market_kind = ["quote_assets"] pairs.
+#
+# Tip: to include every ticker with a matching base asset regardless
+# of quote currency, use an empty string: linear = [""]
 
 [whitelist.binance]
 spot = ["USDT"]
