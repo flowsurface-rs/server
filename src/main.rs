@@ -118,7 +118,7 @@ impl App {
             if config.pairs.discovery_mode {
                 tracing::warn!(
                     "No matching pairs for base_assets {:?} with current whitelist \
-                     — discovery mode is on, so /exchanges is still populated.",
+                     - discovery mode is on, so /exchanges is still populated.",
                     config.pairs.base_assets
                 );
             } else {
@@ -227,25 +227,27 @@ impl App {
             self.rate_limiter,
             admission_gate,
         ));
-        let server_handle = server.serve(self.bind_address).await;
+        let (server_task, server_shutdown_handle) = server.serve(self.bind_address).await;
 
         AppHandles {
             shutdown,
             stream_mgr: Some(stream_mgr),
             flusher,
             _cleanup,
-            _server: server_handle,
+            _server: server_task,
+            server_shutdown_handle,
         }
     }
 }
 
-/// Runtime handles for the active pipeline — provides ordered shutdown.
+/// Runtime handles for the active pipeline - provides ordered shutdown.
 struct AppHandles {
     shutdown: CancellationToken,
     stream_mgr: Option<stream::StreamManager>,
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
     _server: tokio::task::JoinHandle<()>,
+    server_shutdown_handle: axum_server::Handle,
 }
 
 impl AppHandles {
@@ -275,7 +277,7 @@ impl AppHandles {
 
         // 3. Join everything within the grace period.
         tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
-            // Flusher first — it drains the trade buffer to disk.
+            // Flusher first - it drains the trade buffer to disk.
             let _ = self.flusher.await;
 
             // Streaming tasks (engine + handler).
@@ -283,13 +285,18 @@ impl AppHandles {
                 mgr.shutdown().await;
             }
 
-            // Background cleanup (may be mid-VACUUM — let it finish).
+            // Background cleanup (may be mid-VACUUM - let it finish).
             let _ = self._cleanup.await;
 
-            // Axum server.
+            // Axum server - signal graceful shutdown first so it stops
+            // accepting new connections and drains in-flight requests.
+            self.server_shutdown_handle
+                .graceful_shutdown(Some(std::time::Duration::from_secs(3)));
             let _ = self._server.await;
         })
         .await
         .ok();
+
+        tracing::info!("Shutdown complete.");
     }
 }

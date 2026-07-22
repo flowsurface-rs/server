@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use flowsurface_exchange::{
     Ticker, Trade,
@@ -464,7 +465,10 @@ impl Server {
     /// use `axum_server` with a [`LimiterAcceptor`] that caps concurrent
     /// connections at [`MAX_CONCURRENT_CONNECTIONS`] (default 512).  Once the
     /// ceiling is hit, new connections are dropped immediately (TCP reset).
-    pub async fn serve(self: Arc<Self>, bind_address: SocketAddr) -> tokio::task::JoinHandle<()> {
+    pub async fn serve(
+        self: Arc<Self>,
+        bind_address: SocketAddr,
+    ) -> (tokio::task::JoinHandle<()>, Handle) {
         let tls_config = self.tls_config.clone();
         let limiter = self.connection_limiter.clone();
 
@@ -502,7 +506,10 @@ impl Server {
 
         let router = public.merge(protected);
 
-        tokio::spawn(async move {
+        let handle = Handle::new();
+        let handle_for_server = handle.clone();
+
+        let join_handle = tokio::spawn(async move {
             // Bind synchronously for both paths — axum_server needs a
             // std::net::TcpListener regardless of TLS.
             let std_listener = match std::net::TcpListener::bind(bind_address) {
@@ -519,56 +526,59 @@ impl Server {
 
             let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
 
-            let result =
-                if let Some(cfg) = tls_config {
-                    tracing::info!("Starting HTTPS API on {bind_address}");
-                    let mut server = axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
-                        .map(|acceptor| LimiterAcceptor {
-                            inner: acceptor,
-                            limiter: limiter.clone(),
-                        });
+            let result = if let Some(cfg) = tls_config {
+                tracing::info!("Starting HTTPS API on {bind_address}");
+                let mut server = axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
+                    .handle(handle_for_server.clone())
+                    .map(|acceptor| LimiterAcceptor {
+                        inner: acceptor,
+                        limiter: limiter.clone(),
+                    });
 
-                    // HTTP/1: 10 s to read request headers; cap headers at 100.
-                    server
-                        .http_builder()
-                        .http1()
-                        .header_read_timeout(Duration::from_secs(10))
-                        .max_headers(100);
-                    // HTTP/2: PING every 30 s; drop if no response in 5 s.
-                    server
-                        .http_builder()
-                        .http2()
-                        .keep_alive_interval(Some(Duration::from_secs(30)))
-                        .keep_alive_timeout(Duration::from_secs(5));
+                // HTTP/1: 10 s to read request headers; cap headers at 100.
+                server
+                    .http_builder()
+                    .http1()
+                    .header_read_timeout(Duration::from_secs(10))
+                    .max_headers(100);
+                // HTTP/2: PING every 30 s; drop if no response in 5 s.
+                server
+                    .http_builder()
+                    .http2()
+                    .keep_alive_interval(Some(Duration::from_secs(30)))
+                    .keep_alive_timeout(Duration::from_secs(5));
 
-                    server.serve(make_svc).await
-                } else {
-                    tracing::info!("Starting HTTP API on {bind_address}");
-                    let mut server =
-                        axum_server::from_tcp(std_listener).map(|acceptor| LimiterAcceptor {
-                            inner: acceptor,
-                            limiter: limiter.clone(),
-                        });
+                server.serve(make_svc).await
+            } else {
+                tracing::info!("Starting HTTP API on {bind_address}");
+                let mut server = axum_server::from_tcp(std_listener)
+                    .handle(handle_for_server.clone())
+                    .map(|acceptor| LimiterAcceptor {
+                        inner: acceptor,
+                        limiter: limiter.clone(),
+                    });
 
-                    server
-                        .http_builder()
-                        .http1()
-                        .header_read_timeout(Duration::from_secs(10))
-                        .max_headers(100);
+                server
+                    .http_builder()
+                    .http1()
+                    .header_read_timeout(Duration::from_secs(10))
+                    .max_headers(100);
 
-                    server
-                        .http_builder()
-                        .http2()
-                        .keep_alive_interval(Some(Duration::from_secs(30)))
-                        .keep_alive_timeout(Duration::from_secs(5));
+                server
+                    .http_builder()
+                    .http2()
+                    .keep_alive_interval(Some(Duration::from_secs(30)))
+                    .keep_alive_timeout(Duration::from_secs(5));
 
-                    server.serve(make_svc).await
-                };
+                server.serve(make_svc).await
+            };
 
             if let Err(e) = result {
                 tracing::error!("Server error on {bind_address}: {e:#}");
             }
-        })
+        });
+
+        (join_handle, handle)
     }
 }
 
