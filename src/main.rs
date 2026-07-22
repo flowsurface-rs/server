@@ -136,7 +136,7 @@ impl App {
             resolved_pairs
                 .iter()
                 .map(|ti| ti.exchange())
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<rustc_hash::FxHashSet<_>>()
                 .len()
         );
 

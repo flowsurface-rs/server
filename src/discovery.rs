@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use flowsurface_exchange::adapter::{AdapterHandles, Exchange, MarketKind, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::config::WhitelistTemplates;
 
-pub type MetadataCache = HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>;
+pub type MetadataCache = FxHashMap<Exchange, FxHashMap<Ticker, Option<TickerInfo>>>;
 
 /// Orchestrate the full pair discovery pipeline: determine which venues to
 /// use based on discovery mode, spawn adapter handles, fetch ticker metadata
@@ -46,7 +46,7 @@ async fn build_metadata_cache(
     templates: &WhitelistTemplates,
     discovery_mode: bool,
 ) -> MetadataCache {
-    let mut cache = MetadataCache::new();
+    let mut cache = MetadataCache::default();
 
     if discovery_mode {
         for exchange in Exchange::ALL {
@@ -56,7 +56,7 @@ async fn build_metadata_cache(
             match handles.fetch_ticker_metadata(venue, &[market]).await {
                 Ok(meta) => {
                     tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
-                    cache.insert(exchange, meta);
+                    cache.insert(exchange, meta.into_iter().collect());
                 }
                 Err(e) => {
                     tracing::warn!("Failed to fetch metadata for {exchange}: {e:#}");
@@ -83,7 +83,7 @@ async fn build_metadata_cache(
                 match handles.fetch_ticker_metadata(venue, &[market]).await {
                     Ok(meta) => {
                         tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
-                        cache.insert(exchange, meta);
+                        cache.insert(exchange, meta.into_iter().collect());
                     }
                     Err(e) => {
                         tracing::warn!("Failed to fetch metadata for {exchange}: {e:#}");
@@ -102,7 +102,7 @@ async fn build_metadata_cache(
 /// Hyperliquid's opaque internal ID `"@107"`).
 ///
 /// Returns symbols in UPPERCASE for consistent display in the `/exchanges` API.
-pub fn tickers_per_exchange(cache: &MetadataCache) -> HashMap<String, Vec<String>> {
+pub fn tickers_per_exchange(cache: &MetadataCache) -> FxHashMap<String, Vec<String>> {
     cache
         .iter()
         .map(|(exchange, tickers)| {
@@ -171,7 +171,7 @@ fn resolve_pairs(
     cache: &MetadataCache,
 ) -> Vec<TickerInfo> {
     let mut pairs = Vec::new();
-    let mut seen: HashSet<(Exchange, Ticker)> = HashSet::new();
+    let mut seen: FxHashSet<(Exchange, Ticker)> = FxHashSet::default();
 
     for base in base_assets {
         let base_upper = base.to_uppercase();

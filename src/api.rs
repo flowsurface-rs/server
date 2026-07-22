@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -15,6 +14,7 @@ use flowsurface_exchange::{
     Ticker, Trade,
     adapter::{Exchange, MarketKind, Venue},
 };
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -158,7 +158,7 @@ impl Server {
         storage: Storage,
         auth_token: Option<BearerToken>,
         configured_pairs: Vec<Ticker>,
-        available_tickers: &HashMap<String, Vec<String>>,
+        available_tickers: &FxHashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
         rate_limiter: Option<RateLimiter>,
         admission_gate: AdmissionGate,
@@ -336,8 +336,7 @@ impl Server {
         };
 
         // Build a lookup keyed by "exchange:symbol" from DB results.
-        let mut by_key: std::collections::HashMap<String, &PairInfo> =
-            std::collections::HashMap::new();
+        let mut by_key: FxHashMap<String, &PairInfo> = FxHashMap::default();
         for p in &db_pairs {
             let ex_str = p.ticker.exchange.to_string();
             let sym_str = p.ticker.to_string().to_lowercase();

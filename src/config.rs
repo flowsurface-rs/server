@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +44,7 @@ impl fmt::Display for ConfigMarketKind {
 /// For example `{"binance": {"spot": ["USDT"], "linear": ["USDT", "USDC"]}}`.
 /// The server constructs the correct ticker string per exchange
 /// (handling separators, _PERP, -SWAP suffixes, etc.).
-pub type WhitelistTemplates = HashMap<String, HashMap<ConfigMarketKind, Vec<String>>>;
+pub type WhitelistTemplates = FxHashMap<String, FxHashMap<ConfigMarketKind, Vec<String>>>;
 
 #[derive(Parser)]
 #[command(name = "flowsurface-server", about = "Trade data store daemon")]

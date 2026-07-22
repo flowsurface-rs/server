@@ -1,10 +1,9 @@
+use rustc_hash::FxHashMap;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use flowsurface_exchange::TickerInfo;
 use flowsurface_exchange::adapter::{AdapterHandles, Event, StreamKind};
-
-use std::collections::HashMap;
 
 use flowsurface_exchange::adapter::{
     Exchange, MAX_KLINE_STREAMS_PER_STREAM, StreamConfig, StreamTicksize,
@@ -164,7 +163,7 @@ impl StreamManager {
         let (event_rx, stream_tasks) = {
             let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
-            let mut by_exchange: HashMap<Exchange, Vec<StreamKind>> = HashMap::new();
+            let mut by_exchange: FxHashMap<Exchange, Vec<StreamKind>> = FxHashMap::default();
             for stream in &all_streams {
                 let exchange = stream.ticker_info().exchange();
                 by_exchange.entry(exchange).or_default().push(*stream);

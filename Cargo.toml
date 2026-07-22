@@ -25,7 +25,8 @@ base64 = "0.22"
 flowsurface-exchange = "0.8.9"
 
 # Storage
-duckdb = { version = "1.10504", features = ["bundled"] }
+duckdb = { version = "1.10505", features = ["bundled"] }
+rustc-hash = "2.1.3"
 
 # Arrow IPC (zero-copy columnar transport)
 arrow = { version = "58", default-features = false, features = ["ipc"] }
@@ -53,4 +54,3 @@ anyhow = "1"
 lto = "thin"
 codegen-units = 1
 strip = true
-
