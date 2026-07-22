@@ -6,84 +6,99 @@ A trade data collector for crypto markets, with an embedded database and REST AP
 - Persists trades to [DuckDB](https://duckdb.org)
 - Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
-It's lightweight and single-binary portable, designed to run on a small VPS for individual use; not for production nor shared-usage.
+It's a self-contained, portable server, designed to run on a small VPS for individual use; not for production or shared use.
 
 ## Quick start
 
-1. **Copy the template**:
+### Prebuilt binaries
+
+1. **Get the latest [release](https://github.com/akenshaw/fs-server/releases/latest)**
+   (`linux-x86_64` or `linux-aarch64`).
+
+2. **Copy the config template**:
+
+    ```bash
+    # in the extracted directory
+    cp config.example.toml config.toml
+    ```
+
+3. **Run**:
+
+    ```bash
+    ./flowsurface-server
+    ```
+
+    Or with a custom config path:
+
+    ```bash
+    ./flowsurface-server --config /path/to/config.toml
+    ```
+
+### Build from source
 
 ```bash
+cargo build --release
+
 cp config.example.toml config.toml
+
+# run
+./target/release/flowsurface-server
 ```
 
-> See the [basic settings](#basic) and edit `config.toml`
+By default the server looks for `config.toml` in the project root when the
+executable path contains `/target/` (development); otherwise it looks next
+to the executable (deployed binary). Use `--config /path/to/config.toml` to
+override.
 
-2. **Run**
-
-```bash
-# looks for `config.toml` next to the binary.
-./flowsurface-server
-```
-
-Or to use a custom config path:
-
-```bash
-./flowsurface-server --config /path/to/config.toml
-```
-
-> If you run without a config file, the server will write the
-> template to the given path and then exit. Simply edit the generated file and re-run.
+> If `config.toml` doesn't exist, the server writes the default
+> template to that path and **exits** (code 2). Edit the created file to suit
+> your needs, then re-run.
 
 ## Configuration
 
 See [`config.example.toml`](config.example.toml) for all
 available options with inline documentation.
 
-### Basic
+### `[network]`
 
-| Option                 | Default | Description                                                                                             |
-| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
-| `bind_address`         | —       | Socket address to bind (`127.0.0.1:8080` = local-only plain HTTP; `0.0.0.0:8080` = remote HTTPS + auth) |
-| `base_assets`          | —       | Base assets expanded via whitelist templates (e.g. `["BTC", "ETH"]`)                                    |
-| `max_storage_mb`       | `4096`  | Hard cap on database file size (MB); `0` = unlimited.                                                   |
-| `data_retention_hours` | `168`   | Trades older than this are purged; `0` = keep all indefinitely.                                         |
+| Option         | Default                | Description                                      |
+| -------------- | ---------------------- | ------------------------------------------------ |
+| `bind_address` | `127.0.0.1:8080`       | Listen address; non-loopback enables TLS + auth. |
+| `max_requests` | `500`                  | Per-IP rate limit (req/10s); `0` = off.          |
+| `tls_domain`   | `"flowsurface-server"` | Domain name for the self-signed TLS cert's SAN.  |
 
-### Advanced
+### `[storage]`
 
-| Option                | Default                | Description                                                                       |
-| --------------------- | ---------------------- | --------------------------------------------------------------------------------- |
-| `discovery_mode`      | `true`                 | Fetch metadata for all exchange variants so `/exchanges` is fully populated       |
-| `tls_domain`          | `"flowsurface-server"` | Domain in the self-signed TLS cert's SAN (only needed for verified TLS)           |
-| `flush_interval_ms`   | `2000`                 | How often buffered trades are written to disk (ms); higher = fewer writes         |
-| `max_buffered_trades` | `200000`               | Max trades in memory buffer before dropping (OOM guard)                           |
-| `max_requests`        | `500`                  | Per-IP rate limit (req/10s); `0` = disabled. Burst up to 500, sustained ~50 req/s |
+| Option                 | Default  | Description                                       |
+| ---------------------- | -------- | ------------------------------------------------- |
+| `data_dir`             | `"data"` | Directory for DB, auth token, and TLS certs.      |
+| `max_storage_mb`       | `4096`   | Hard cap on DB+WAL (MB); `0` = unlimited.         |
+| `data_retention_hours` | `168`    | Purge trades older than this; `0` = keep all.     |
+| `flush_interval_ms`    | `2000`   | Write interval (ms); higher = fewer disk writes.  |
+| `max_buffered_trades`  | `200000` | In-memory buffer cap before dropping (OOM guard). |
+
+### `[pairs]`
+
+| Option           | Default | Description                                                      |
+| ---------------- | ------- | ---------------------------------------------------------------- |
+| `base_assets`    | `[]`    | Bases combined with whitelist quotes to determine tracked pairs. |
+| `discovery_mode` | `true`  | Fetch metadata for all exchanges (populates `/exchanges`).       |
 
 ### Whitelist templates
 
-The whitelist defines which pairs to track per venue and market kind:
+The whitelist defines which pairs to track per venue and market kind.
+See the `[whitelist.*]` sections in [`config.example.toml`](config.example.toml)
+for the template. The server combines `base_assets × quote_assets`
+per market kind and resolves the correct exchange-specific ticker strings
+(handling separators, `_PERP`, `-SWAP` suffixes, etc.).
 
-```toml
-[whitelist.binance]
-spot = ["USDT"]
-linear = ["USDT", "USDC"]
-inverse = ["USD"]
+> **Wildcard:** An empty string `""` as a quote asset includes **every**
+> ticker on that exchange whose base matches (e.g.
+> `linear = [""]` would track all linear perpetuals with a matching base
+> asset regardless of quote currency).
 
-[whitelist.bybit]
-spot = ["USDT"]
-linear = ["USDT"]
-
-[whitelist.hyperliquid]
-linear = ["USDC"]
-
-[whitelist.okex]
-spot = ["USDT"]
-linear = ["USDT"]
-```
-
-The server combines `base_assets × quote_assets` per market kind and
-resolves the correct exchange-specific ticker strings (handling
-separators, `_PERP`, `-SWAP` suffixes, etc.).
-
+Pairs are only tracked when **both** `base_assets` and a matching whitelist
+entry are configured. If either is empty, no pairs are tracked.
 Use the `/exchanges` endpoint to browse available symbols before
 deciding which pairs to track.
 
@@ -92,10 +107,11 @@ deciding which pairs to track.
 When binding to a **non-loopback** address, the server:
 
 1. Generates a random 256-bit auth token on first boot and persists
-   it as `data/.auth_token`.
+   it as `.auth_token` inside the configured `data_dir` (see [`[storage]`](#storage)).
 2. The token's first 4 characters are printed at startup.
 3. Retrieve the full token at any time:
     ```bash
+    # data_dir = "data"
     cat data/.auth_token
     ```
 
@@ -108,9 +124,9 @@ The server automatically enables HTTPS with a **self-signed certificate**
 when binding to a non-loopback address (e.g. `0.0.0.0:8080`).
 
 1. Set `bind_address = "0.0.0.0:8080"` in `config.toml`
-2. Start the server — it generates:
-    - `data/cert.pem` + `data/key.pem` (self-signed TLS cert/key pair)
-    - `data/.auth_token` (random 256-bit token, unless already set)
+2. Start the server, it generates (inside the configured `data_dir`, see [`[storage]`](#storage)):
+    - `cert.pem` + `key.pem` (self-signed TLS cert/key pair)
+    - `.auth_token` (random 256-bit token, unless already set)
 3. Clients connect via `https://vps-ip:8080` using the auth token.
    The cert is self-signed, so most HTTP clients need an explicit flag
    to accept it (`curl -k`, `verify=False` in `requests`,
@@ -132,9 +148,19 @@ cert's Subject Alternative Name matches:
 tls_domain = "data.mydomain.com"
 ```
 
-Then connect via `https://data.mydomain.com:8080` — raw-IP connections
-are not supported for verified TLS. The cert's SHA-256 fingerprint is
-logged at startup for pinning.
+Then connect via `https://data.mydomain.com:{port}` (using the port from
+`bind_address`).
+
+Whether verified TLS works via a raw IP depends on the address you bind to:
+
+- **`0.0.0.0` (recommended for remote)** — no IP SAN is added to the
+  cert, so verified TLS requires a domain name (set `tls_domain`).
+  Raw-IP connections are not supported for verified TLS.
+- **A concrete IP** (e.g. `192.168.1.1:8080`) — an IP SAN is
+  automatically included, so verified TLS works via that IP directly.
+
+The cert's SHA-256 fingerprint (hex and `sha256$...`) is logged at
+startup for pinning.
 
 ### Local development
 
@@ -146,7 +172,7 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 
 ## API endpoints
 
-`/status` is **public** (no auth) — suitable for health checks.
+`/status` is **public** (no auth).
 All other endpoints require `Authorization: Bearer <token>` when
 auth is configured.
 
@@ -160,8 +186,7 @@ auth is configured.
 
 ### GET /status
 
-Returns the server health status. No authentication required — suitable for
-load balancer health checks.
+Returns the server health status. No authentication required.
 
 #### Response fields
 
@@ -269,15 +294,23 @@ Returns trade records matching the given filter.
 | `to`     | int    | Unix ms upper bound (inclusive)              |
 | `limit`  | int    | Max records (default 1000, max 10 000)       |
 
+> **Sort order:** When `from` is specified, rows are returned oldest-first.
+> When `from` is omitted, rows are returned newest-first.
+
 #### Response fields
 
-| Field     | Type  | Description                        |
-| --------- | ----- | ---------------------------------- |
-| `trades`  | array | Array of matching trades           |
-| `ts`      | int   | Unix millisecond timestamp         |
-| `price`   | float | Trade price                        |
-| `qty`     | float | Trade quantity                     |
-| `is_sell` | bool  | `true` if a sell, `false` if a buy |
+| Field    | Type  | Description                     |
+| -------- | ----- | ------------------------------- |
+| `trades` | array | Array of matching trade objects |
+
+Each trade object:
+
+| Field     | Type  | Description                                                                        |
+| --------- | ----- | ---------------------------------------------------------------------------------- |
+| `ts`      | int   | Unix millisecond timestamp                                                         |
+| `price`   | float | Price                                                                              |
+| `qty`     | float | Normalized quantity (base units for spot/linear, quote notional for inverse perps) |
+| `is_sell` | bool  | `true` if a sell, `false` if a buy                                                 |
 
 #### Example
 
@@ -308,9 +341,11 @@ curl -H "Authorization: Bearer <token>" \
 ### GET /trades.arrow
 
 Same filtering as `/trades` but returns an **Arrow IPC streaming
-format** payload (`Content-Type: application/vnd.apache.arrow.stream`)
-with 4 columns: `ts (int64)`, `price (float64)`, `qty (float64)`,
-`is_sell (bool)`.
+format** payload (`Content-Type: application/vnd.apache.arrow.stream`
+with `Content-Disposition: attachment; filename="trades.arrow"`)
+with 4 columns:
+
+> `ts (int64)`, `price (float64)`, `qty (float64)`, `is_sell (bool)`
 
 This is ideal for high-volume data transfer to clients that support Arrow natively.
 
@@ -322,3 +357,5 @@ This is ideal for high-volume data transfer to clients that support Arrow native
 | `from`   | int    | Unix ms lower bound (inclusive)              |
 | `to`     | int    | Unix ms upper bound (inclusive)              |
 | `limit`  | int    | Max records (default 100 000, max 1 000 000) |
+
+> **Sort order:** Same as `/trades`.

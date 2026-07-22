@@ -86,6 +86,22 @@ pub struct TradeQuery {
 }
 
 impl TradeQuery {
+    /// Validate that `venue` and `market` parse into known enum variants.
+    /// Returns a human-readable error string on failure.
+    pub fn validate(&self) -> Result<(), String> {
+        let _venue: Venue = self
+            .venue
+            .parse()
+            .map_err(|_| format!("unknown venue: '{}'", self.venue))?;
+        let _market: MarketKind = self.market.parse().map_err(|_| {
+            format!(
+                "unknown market kind: '{}' (expected spot, linear, or inverse)",
+                self.market
+            )
+        })?;
+        Ok(())
+    }
+
     /// Derive an exchange filter string from a `TradeQuery`'s `venue` + `market`.
     pub fn exchange_filter(self: &TradeQuery) -> String {
         exchange_from_venue_market(&self.venue, &self.market)
@@ -273,6 +289,9 @@ impl Server {
 
     /// GET /trades
     async fn trades(State(state): State<Arc<Self>>, query: Query<TradeQuery>) -> impl IntoResponse {
+        if let Err(msg) = query.validate() {
+            return Self::json_err(StatusCode::BAD_REQUEST, &msg);
+        }
         match state.storage.query_trades(&query) {
             Ok(trades) => Self::json_ok(&Response::Trades { trades }),
             Err(e) => {
@@ -297,8 +316,11 @@ impl Server {
         State(state): State<Arc<Self>>,
         query: Query<TradeQuery>,
     ) -> axum::response::Response {
-        let limit = query.limit.unwrap_or(100_000).min(1_000_000);
+        if let Err(msg) = query.validate() {
+            return Server::json_err(StatusCode::BAD_REQUEST, &msg);
+        }
 
+        let limit = query.limit.unwrap_or(100_000).min(1_000_000);
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 
@@ -370,12 +392,16 @@ impl Server {
                 }
             } else {
                 tracing::info!("Starting HTTP API on {bind_address}");
-                let listener = tokio::net::TcpListener::bind(bind_address)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Failed to bind to {bind_address}: {e}");
-                        std::process::exit(1);
-                    });
+                let listener = match tokio::net::TcpListener::bind(bind_address).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to bind to {bind_address}: {e:#}. \
+                             Server will not accept connections."
+                        );
+                        return;
+                    }
+                };
                 if let Err(e) = axum::serve(
                     listener,
                     router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -402,7 +428,7 @@ async fn rate_limit_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if let Some(ref limiter) = state.rate_limiter
-        && !limiter.check(peer_addr.ip())
+        && !limiter.check(peer_addr.ip()).await
     {
         tracing::warn!(
             "Rate limit exceeded for {} on {}",

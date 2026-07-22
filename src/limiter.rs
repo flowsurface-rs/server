@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 /// Per-IP token-bucket rate limiter.
 ///
@@ -50,8 +51,8 @@ impl RateLimiter {
     /// Check whether `ip` is within the rate limit.
     ///
     /// Returns `true` if the request is allowed, `false` if rate-limited.
-    pub fn check(&self, ip: IpAddr) -> bool {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    pub async fn check(&self, ip: IpAddr) -> bool {
+        let mut inner = self.inner.lock().await;
         let now = Instant::now();
 
         if now >= inner.next_cleanup {

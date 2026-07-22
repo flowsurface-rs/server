@@ -2,9 +2,9 @@ mod api;
 mod cleanup;
 mod config;
 mod discovery;
-mod ingestion;
 mod limiter;
 mod storage;
+mod stream;
 mod tls;
 
 use std::net::SocketAddr;
@@ -13,11 +13,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use flowsurface_exchange::adapter::{AdapterHandles, Venue};
+use flowsurface_exchange::adapter::AdapterHandles;
 use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
@@ -108,24 +107,12 @@ impl App {
             std::process::exit(1);
         }
 
-        let venues: Vec<Venue> = if config.pairs.discovery_mode {
-            Venue::ALL.to_vec()
-        } else {
-            discovery::venues_from_whitelist(&whitelist)
-        };
-        tracing::info!("Spawning venue adapters: {venues:?}");
-        let adapter_handles = AdapterHandles::spawn_venues(venues, None);
-
-        tracing::info!("Fetching ticker metadata from exchanges…");
-        let metadata_cache = discovery::build_metadata_cache(
-            &adapter_handles,
-            &whitelist,
+        let (adapter_handles, metadata_cache, resolved_pairs) = discovery::setup_pairs(
+            &config.pairs.base_assets,
             config.pairs.discovery_mode,
+            &whitelist,
         )
         .await;
-
-        let resolved_pairs =
-            discovery::resolve_pairs(&config.pairs.base_assets, &whitelist, &metadata_cache);
 
         if resolved_pairs.is_empty() {
             if config.pairs.discovery_mode {
@@ -158,63 +145,17 @@ impl App {
             tracing::warn!("Failed to persist ticker metadata: {e:#}");
         }
 
-        // Only generate TLS cert for non-loopback addresses.
-        let tls_config = if config.network.bind_address.ip().is_loopback() {
-            None
-        } else {
-            let tls_domain = config.network.tls_domain.clone();
-            let bind_ip = (!config.network.bind_address.ip().is_unspecified())
-                .then_some(config.network.bind_address.ip());
-
-            let cert_path = data_dir.join("cert.pem");
-            let key_path = data_dir.join("key.pem");
-            if cert_path.exists() && key_path.exists() {
-                let stored_domain = storage.get_metadata("tls_domain").ok().flatten();
-                if stored_domain.as_deref() != Some(tls_domain.as_str()) {
-                    tracing::warn!(
-                        "tls_domain changed ({:?} → {:?}), regenerating TLS certificate",
-                        stored_domain,
-                        tls_domain,
-                    );
-                    std::fs::remove_file(&cert_path).ok();
-                    std::fs::remove_file(&key_path).ok();
-                }
-            }
-
-            let tls_cert =
-                tls::load_or_generate(data_dir, &tls_domain, bind_ip).unwrap_or_else(|e| {
-                    tracing::error!("Failed to load/generate TLS certificate: {e:#}");
-                    std::process::exit(1);
-                });
-
-            if let Err(e) = storage.set_metadata("tls_domain", &tls_domain) {
-                tracing::warn!("Failed to persist tls_domain metadata: {e:#}");
-            }
-
-            tracing::info!(
-                "TLS certificate fingerprint (SHA-256): {}",
-                tls_cert.fingerprint
-            );
-            tracing::info!(
-                "Use this fingerprint for cert pinning: sha256${}",
-                tls_cert.fingerprint
-            );
-
-            Some(
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        axum_server::tls_rustls::RustlsConfig::from_pem(
-                            tls_cert.cert_pem.as_bytes().to_vec(),
-                            tls_cert.key_pem.as_bytes().to_vec(),
-                        ),
-                    )
-                })
-                .unwrap_or_else(|e| {
-                    tracing::error!("Failed to build TLS config: {e:#}");
-                    std::process::exit(1);
-                }),
-            )
-        };
+        let tls_config = tls::setup_tls_config(
+            data_dir,
+            &storage,
+            config.network.bind_address,
+            &config.network.tls_domain,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("{e:#}");
+            std::process::exit(1);
+        });
 
         let rate_limiter = config.network.rate_limit_max().map(|max| {
             tracing::info!(
@@ -239,10 +180,15 @@ impl App {
         }
     }
 
-    /// Start the pipeline (flusher, cleanup, ingest) and the HTTP server.
+    /// Start the pipeline (stream engine, flusher, cleanup) and the HTTP server.
     async fn serve(self) -> AppHandles {
-        let (trade_tx, trade_rx) = mpsc::unbounded_channel::<api::AnnotatedTrade>();
         let shutdown = CancellationToken::new();
+
+        let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
+            self.adapter_handles,
+            &self.resolved_pairs,
+            shutdown.child_token(),
+        );
 
         let cleanup_last_run = tokio::task::spawn_blocking({
             let scheduler = self.cleanup_scheduler.clone();
@@ -251,23 +197,15 @@ impl App {
         .await
         .unwrap_or(None);
 
-        let flusher = self.storage.spawn_batch_flusher(
-            trade_rx,
-            self.flush_interval,
-            self.max_buffered_trades,
-        );
-
         let _cleanup = self
             .cleanup_scheduler
             .spawn(cleanup_last_run, shutdown.child_token());
 
-        let ingest = ingestion::start_all_ingest_tasks(
-            &self.resolved_pairs,
-            self.adapter_handles,
-            trade_tx.clone(),
-            shutdown.child_token(),
-        )
-        .await;
+        let flusher = self.storage.spawn_batch_flusher(
+            &mut rx,
+            self.flush_interval,
+            self.max_buffered_trades,
+        );
 
         let configured_pairs: Vec<Ticker> =
             self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
@@ -285,10 +223,9 @@ impl App {
 
         AppHandles {
             shutdown,
-            _trade_tx: trade_tx,
+            stream_mgr: Some(stream_mgr),
             flusher,
             _cleanup,
-            ingest,
             _server: server_handle,
         }
     }
@@ -297,19 +234,18 @@ impl App {
 /// Runtime handles for the active pipeline — provides ordered shutdown.
 struct AppHandles {
     shutdown: CancellationToken,
-    _trade_tx: mpsc::UnboundedSender<api::AnnotatedTrade>,
+    stream_mgr: Option<stream::StreamManager>,
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
-    ingest: Vec<tokio::task::JoinHandle<()>>,
     _server: tokio::task::JoinHandle<()>,
 }
 
 impl AppHandles {
     const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
-    /// Wait for SIGINT/SIGTERM, then drain in-flight trades
-    /// and join all background tasks within the grace period.
-    async fn shutdown(self) {
+    /// Wait for SIGINT/SIGTERM, then cancel all streams, drain in-flight
+    /// trades, and join every background task within the grace period.
+    async fn shutdown(mut self) {
         let mut sigint =
             signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
         let mut sigterm =
@@ -320,14 +256,30 @@ impl AppHandles {
         }
 
         tracing::info!("Shutting down…");
-        self.shutdown.cancel();
-        drop(self._trade_tx); // drop the extra sender so the flusher can drain
 
+        // 1. Cancel all stream tasks (they share the root token).
+        self.shutdown.cancel();
+
+        // 2. Drop persist sender so downstream consumers drain.
+        if let Some(ref mut mgr) = self.stream_mgr {
+            mgr.drop_persist_sender();
+        }
+
+        // 3. Join everything within the grace period.
         tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
+            // Flusher first — it drains the trade buffer to disk.
             let _ = self.flusher.await;
-            for h in self.ingest {
-                let _ = h.await;
+
+            // Streaming tasks (engine + handler).
+            if let Some(mgr) = self.stream_mgr.take() {
+                mgr.shutdown().await;
             }
+
+            // Background cleanup (may be mid-VACUUM — let it finish).
+            let _ = self._cleanup.await;
+
+            // Axum server.
+            let _ = self._server.await;
         })
         .await
         .ok();
