@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use axum::http::StatusCode;
 use duckdb::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -461,6 +462,37 @@ impl Storage {
             Some(Ok(v)) => Ok(Some(v)),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
+        }
+    }
+
+    /// Run a blocking DuckDB query on the blocking thread pool with a timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err((StatusCode, &'static str))` suitable for `json_err` on:
+    /// - Query failure (the closure returned `Err`)
+    /// - Task panic (`spawn_blocking` panicked)
+    /// - Timeout (the deadline elapsed)
+    pub async fn run_blocking_query<T: Send + 'static>(
+        self,
+        deadline: Duration,
+        label: &str,
+        f: impl FnOnce(Storage) -> anyhow::Result<T> + Send + 'static,
+    ) -> Result<T, (StatusCode, &'static str)> {
+        match tokio::time::timeout(deadline, tokio::task::spawn_blocking(move || f(self))).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(e))) => {
+                tracing::error!("{label} query failed: {e:#}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+            }
+            Ok(Err(join_err)) => {
+                tracing::error!("{label} query task panicked: {join_err:#}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+            }
+            Err(_) => {
+                tracing::warn!("{label} query timed out after {deadline:?}");
+                Err((StatusCode::SERVICE_UNAVAILABLE, "query timed out"))
+            }
         }
     }
 

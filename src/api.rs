@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -327,12 +327,14 @@ impl Server {
     /// Pairs that have been configured but have not yet received any trades
     /// appear with `earliest: null` / `latest: null`.
     async fn pairs(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        let db_pairs = match state.storage.pairs_with_bounds() {
+        let storage = state.storage.clone();
+
+        let db_pairs = match storage
+            .run_blocking_query(Duration::from_secs(30), "pairs", |s| s.pairs_with_bounds())
+            .await
+        {
             Ok(pairs) => pairs,
-            Err(e) => {
-                tracing::error!("Failed to query pairs: {e:#}");
-                return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
-            }
+            Err((status, msg)) => return Self::json_err(status, msg),
         };
 
         // Build a lookup keyed by "exchange:symbol" from DB results.
@@ -374,12 +376,18 @@ impl Server {
         if let Err(msg) = query.validate() {
             return Self::json_err(StatusCode::BAD_REQUEST, &msg);
         }
-        match state.storage.query_trades(&query) {
+
+        let storage = state.storage.clone();
+
+        let q = query.0;
+        match storage
+            .run_blocking_query(Duration::from_secs(30), "trades", move |s| {
+                s.query_trades(&q)
+            })
+            .await
+        {
             Ok(trades) => Self::json_ok(&Response::Trades { trades }),
-            Err(e) => {
-                tracing::error!("Failed to query trades: {e:#}");
-                Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-            }
+            Err((status, msg)) => Self::json_err(status, msg),
         }
     }
 
@@ -406,12 +414,16 @@ impl Server {
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 
-        let arrow_bytes = match state.storage.query_trades_arrow_ipc(&bounded) {
+        let storage = state.storage.clone();
+
+        let arrow_bytes = match storage
+            .run_blocking_query(Duration::from_secs(30), "arrow", move |s| {
+                s.query_trades_arrow_ipc(&bounded)
+            })
+            .await
+        {
             Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::error!("Arrow export failed: {e:#}");
-                return Server::json_err(StatusCode::INTERNAL_SERVER_ERROR, "arrow export failed");
-            }
+            Err((status, msg)) => return Server::json_err(status, msg),
         };
 
         (
@@ -507,28 +519,51 @@ impl Server {
 
             let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
 
-            // Both code paths share the same structure: create an
-            // axum_server, wrap its acceptor with the connection
-            // limiter, then serve.
-            let result = if let Some(cfg) = tls_config {
-                tracing::info!("Starting HTTPS API on {bind_address}");
-                axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
-                    .map(|acceptor| LimiterAcceptor {
-                        inner: acceptor,
-                        limiter: limiter.clone(),
-                    })
-                    .serve(make_svc)
-                    .await
-            } else {
-                tracing::info!("Starting HTTP API on {bind_address}");
-                axum_server::from_tcp(std_listener)
-                    .map(|acceptor| LimiterAcceptor {
-                        inner: acceptor,
-                        limiter: limiter.clone(),
-                    })
-                    .serve(make_svc)
-                    .await
-            };
+            let result =
+                if let Some(cfg) = tls_config {
+                    tracing::info!("Starting HTTPS API on {bind_address}");
+                    let mut server = axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
+                        .map(|acceptor| LimiterAcceptor {
+                            inner: acceptor,
+                            limiter: limiter.clone(),
+                        });
+
+                    // HTTP/1: 10 s to read request headers; cap headers at 100.
+                    server
+                        .http_builder()
+                        .http1()
+                        .header_read_timeout(Duration::from_secs(10))
+                        .max_headers(100);
+                    // HTTP/2: PING every 30 s; drop if no response in 5 s.
+                    server
+                        .http_builder()
+                        .http2()
+                        .keep_alive_interval(Some(Duration::from_secs(30)))
+                        .keep_alive_timeout(Duration::from_secs(5));
+
+                    server.serve(make_svc).await
+                } else {
+                    tracing::info!("Starting HTTP API on {bind_address}");
+                    let mut server =
+                        axum_server::from_tcp(std_listener).map(|acceptor| LimiterAcceptor {
+                            inner: acceptor,
+                            limiter: limiter.clone(),
+                        });
+
+                    server
+                        .http_builder()
+                        .http1()
+                        .header_read_timeout(Duration::from_secs(10))
+                        .max_headers(100);
+
+                    server
+                        .http_builder()
+                        .http2()
+                        .keep_alive_interval(Some(Duration::from_secs(30)))
+                        .keep_alive_timeout(Duration::from_secs(5));
+
+                    server.serve(make_svc).await
+                };
 
             if let Err(e) = result {
                 tracing::error!("Server error on {bind_address}: {e:#}");
