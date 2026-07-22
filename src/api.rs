@@ -410,7 +410,7 @@ impl Server {
             return Server::json_err(StatusCode::BAD_REQUEST, &msg);
         }
 
-        let limit = query.limit.unwrap_or(100_000).min(1_000_000);
+        let limit = query.limit.unwrap_or(100_000).min(400_000);
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 

@@ -1,18 +1,21 @@
-use anyhow::{Context, Result};
-use axum::http::StatusCode;
-use duckdb::Connection;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use crate::api::{AnnotatedTrade, TradeQuery};
+use crate::config::{RetentionHours, StorageBytes};
+use crate::stream;
 
 use flowsurface_exchange::adapter::{Event, Exchange};
 use flowsurface_exchange::unit::{price::Price, qty::Qty};
 use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
-use crate::api::{AnnotatedTrade, TradeQuery};
-use crate::config::{RetentionHours, StorageBytes};
-use crate::stream;
+use anyhow::{Context, Result};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use axum::http::StatusCode;
+use duckdb::Connection;
 use tokio::task::JoinHandle;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -280,7 +283,7 @@ impl Storage {
     pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
         let conn = self.connection()?;
 
-        let limit = q.limit.unwrap_or(100_000).min(1_000_000);
+        let limit = q.limit.unwrap_or(100_000).min(400_000);
         let exchange = q.exchange_filter();
         let symbol_lower = q.symbol.to_lowercase();
 
@@ -313,36 +316,26 @@ impl Storage {
 
         let mut stmt = conn.prepare(&sql).context("preparing Arrow IPC query")?;
 
-        let batches: Vec<arrow::record_batch::RecordBatch> = stmt
-            .query_arrow(&params[..])
-            .context("executing Arrow query")?
-            .collect();
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("qty", DataType::Float64, false),
+            Field::new("is_sell", DataType::Boolean, false),
+        ]));
 
-        // Drop the statement so the connection is free for the IPC writer.
-        drop(stmt);
-
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(limit.saturating_mul(32));
+        let mut batch_count = 0usize;
         {
-            use arrow::datatypes::{DataType, Field, Schema};
-            use arrow::ipc::writer::StreamWriter;
-            use std::sync::Arc;
-
-            let schema: Arc<Schema> = if batches.is_empty() {
-                Arc::new(Schema::new(vec![
-                    Field::new("ts", DataType::Int64, false),
-                    Field::new("price", DataType::Float64, false),
-                    Field::new("qty", DataType::Float64, false),
-                    Field::new("is_sell", DataType::Boolean, false),
-                ]))
-            } else {
-                batches[0].schema()
-            };
-
             let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
                 .context("creating Arrow IPC stream writer")?;
 
-            for batch in &batches {
-                writer.write(batch).context("writing Arrow record batch")?;
+            let rows = stmt
+                .query_arrow(&params[..])
+                .context("executing Arrow query")?;
+
+            for batch in rows {
+                writer.write(&batch).context("writing Arrow record batch")?;
+                batch_count += 1;
             }
 
             writer.finish().context("finishing Arrow IPC stream")?;
@@ -351,7 +344,7 @@ impl Storage {
         tracing::debug!(
             "Exported {} bytes of Arrow IPC data ({} batch(es))",
             buf.len(),
-            batches.len()
+            batch_count,
         );
         Ok(buf)
     }
