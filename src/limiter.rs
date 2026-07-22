@@ -227,7 +227,6 @@ impl AdmissionGate {
     /// gate entirely; unknown IPs are subject to both per-IP and global
     /// budgets).
     pub async fn admit(&self, ip: IpAddr) -> bool {
-        // ----- Fast path: trusted IPs skip the gate entirely. -----
         // The per-IP rate limiter (after auth) is their ceiling.
         if self.trusted.lock().await.contains(ip) {
             return true;
@@ -243,24 +242,31 @@ impl AdmissionGate {
             inner.next_cleanup = now + ADMISSION_CLEANUP_INTERVAL;
         }
 
-        // per-IP budget check
-        let bucket = inner.per_ip.entry(ip).or_insert_with(|| Bucket {
-            tokens: self.per_ip_budget,
-            last_refill: now,
-        });
+        // Only track IPs that have previously passed admission — rejected
+        // IPs never enter the map, preventing an attacker from filling it
+        // with requests that were never admitted.
+        let per_ip_ok = if let Some(bucket) = inner.per_ip.get_mut(&ip) {
+            let elapsed = now
+                .saturating_duration_since(bucket.last_refill)
+                .as_secs_f64();
+            bucket.tokens = (bucket.tokens + elapsed * self.per_ip_budget).min(self.per_ip_budget);
+            bucket.last_refill = now;
+            if bucket.tokens < 1.0 {
+                false
+            } else {
+                bucket.tokens -= 1.0;
+                true
+            }
+        } else {
+            // New IP — don't insert yet; only after global check passes.
+            true
+        };
 
-        let elapsed = now
-            .saturating_duration_since(bucket.last_refill)
-            .as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.per_ip_budget).min(self.per_ip_budget);
-        bucket.last_refill = now;
-
-        if bucket.tokens < 1.0 {
-            return false; // this IP exhausted its personal budget
+        if !per_ip_ok {
+            return false;
         }
-        bucket.tokens -= 1.0;
 
-        // ----- Global budget check (shared across all unknown IPs). -----
+        // Global budget check (shared across all unknown IPs)
         let elapsed = now
             .saturating_duration_since(inner.global.last_refill)
             .as_secs_f64();
@@ -269,11 +275,22 @@ impl AdmissionGate {
         inner.global.last_refill = now;
 
         if inner.global.tokens < 1.0 {
-            return false; // global cap exhausted
+            // Refund the per-IP token consumed above (if the IP was
+            // already tracked).
+            if let Some(bucket) = inner.per_ip.get_mut(&ip) {
+                bucket.tokens += 1.0;
+            }
+            return false;
         }
         inner.global.tokens -= 1.0;
 
-        // ----- Memory cap (evict stalest if we have too many IPs). -----
+        // Both checks passed — record this IP if first time through.
+        inner.per_ip.entry(ip).or_insert_with(|| Bucket {
+            tokens: self.per_ip_budget - 1.0, // 1 consumed for this request
+            last_refill: now,
+        });
+
+        // Memory cap (evict stalest if we have too many IPs)
         if inner.per_ip.len() > ADMISSION_MAX_UNKNOWN_IPS {
             let mut entries: Vec<_> = inner.per_ip.drain().collect();
             entries.sort_by_key(|b| std::cmp::Reverse(b.1.last_refill));
@@ -297,16 +314,18 @@ impl AdmissionGate {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Connection-level limiter — protects against TCP/TLS connection-storm DoS
-// ---------------------------------------------------------------------------
-
 /// Maximum number of concurrent TCP connections across all IPs.
 ///
 /// Once this ceiling is reached the server stops accepting new connections
 /// (they see a TCP reset).  This prevents file‑descriptor / tokio‑task /
 /// TLS‑handshake‑CPU exhaustion.
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 512;
+
+// The inner acceptor (e.g. TLS handshake) runs while the permit
+// is held — this is intentional so the handshake CPU burn is
+// also capped.  A timeout ensures incomplete handshakes (slow-
+// loris style) cannot permanently exhaust the connection pool.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A tiny wrapper around `tokio::sync::Semaphore` that caps concurrent
 /// TCP connections.
@@ -414,19 +433,25 @@ where
             });
         };
 
-        // The inner acceptor (e.g. TLS handshake) runs while the permit
-        // is held — this is intentional so the handshake CPU burn is
-        // also capped.
         let inner_fut = self.inner.accept(stream, service);
         Box::pin(async move {
-            let (stream, service) = inner_fut.await?;
-            Ok((
-                stream,
-                PermittedService {
-                    inner: service,
-                    _permit: SharedPermit(Arc::new(permit)),
-                },
-            ))
+            match tokio::time::timeout(ACCEPT_TIMEOUT, inner_fut).await {
+                Ok(Ok((stream, service))) => Ok((
+                    stream,
+                    PermittedService {
+                        inner: service,
+                        _permit: SharedPermit(Arc::new(permit)),
+                    },
+                )),
+                Ok(Err(e)) => Err(e),
+                Err(_elapsed) => {
+                    tracing::warn!("Connection accept timed out after {ACCEPT_TIMEOUT:?}",);
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "handshake timed out",
+                    ))
+                }
+            }
         })
     }
 }
