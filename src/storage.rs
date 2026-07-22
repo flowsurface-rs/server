@@ -34,6 +34,8 @@ pub struct PairInfo {
 pub struct Storage {
     db: Arc<parking_lot::Mutex<duckdb::Connection>>,
     data_dir: PathBuf,
+    start_instant: std::time::Instant,
+    start_wall_ms: i64,
 }
 
 impl Storage {
@@ -85,6 +87,11 @@ impl Storage {
         Ok(Self {
             db: Arc::new(parking_lot::Mutex::new(root)),
             data_dir: data_dir.to_path_buf(),
+            start_instant: std::time::Instant::now(),
+            start_wall_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
         })
     }
 
@@ -457,11 +464,14 @@ impl Storage {
         }
     }
 
-    pub(crate) fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64
+    /// Return a monotonically-increasing timestamp (ms since Unix epoch)
+    /// that is immune to NTP jumps and manual clock changes after startup.
+    ///
+    /// Wall-clock time is captured once in [`open`](Self::open); all
+    /// subsequent calls derive the timestamp from [`Instant::now`],
+    /// which never regresses.
+    pub(crate) fn now_ms(&self) -> i64 {
+        self.start_wall_ms + self.start_instant.elapsed().as_millis() as i64
     }
 
     /// Delete every trade row whose `ts` (milliseconds since epoch) is
@@ -474,7 +484,7 @@ impl Storage {
             return Ok(0);
         }
         let conn = self.connection()?;
-        let cutoff_ms = Self::now_ms() - retention_hours.as_millis();
+        let cutoff_ms = self.now_ms() - retention_hours.as_millis();
         let deleted = conn
             .execute(
                 "DELETE FROM trades WHERE ts < ?1",
@@ -485,7 +495,7 @@ impl Storage {
     }
 
     pub fn record_cleanup(&self) -> Result<i64> {
-        let now_ms = Self::now_ms();
+        let now_ms = self.now_ms();
         self.set_metadata("last_cleanup", &now_ms.to_string())?;
         Ok(now_ms)
     }

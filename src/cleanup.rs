@@ -282,7 +282,13 @@ impl CleanupScheduler {
             let mut last_cleanup = last_cleanup;
 
             loop {
-                let time_delay = Self::delay_until_next_cleanup(last_cleanup, retention_ms);
+                let time_delay = {
+                    let scheduler = CleanupScheduler {
+                        storage: storage.clone(),
+                        config,
+                    };
+                    scheduler.delay_until_next_cleanup(last_cleanup, retention_ms)
+                };
                 let delay =
                     if config.max_storage_bytes.is_some() && SIZE_CHECK_INTERVAL < time_delay {
                         SIZE_CHECK_INTERVAL
@@ -315,8 +321,12 @@ impl CleanupScheduler {
         })
     }
 
-    fn delay_until_next_cleanup(last_cleanup_ms: Option<i64>, retention_ms: i64) -> Duration {
-        let now_ms = Storage::now_ms();
+    fn delay_until_next_cleanup(
+        &self,
+        last_cleanup_ms: Option<i64>,
+        retention_ms: i64,
+    ) -> Duration {
+        let now_ms = self.storage.now_ms();
 
         let Some(anchor_ms) = last_cleanup_ms else {
             // No recorded timestamp — retry quickly (caller applies
