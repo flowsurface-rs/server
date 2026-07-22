@@ -128,10 +128,8 @@ when binding to a non-loopback address (e.g. `0.0.0.0:8080`).
     - `cert.pem` + `key.pem` (self-signed TLS cert/key pair)
     - `.auth_token` (random 256-bit token, unless already set)
 3. Clients connect via `https://vps-ip:8080` using the auth token.
-   The cert is self-signed, so most HTTP clients need an explicit flag
-   to accept it (`curl -k`, `verify=False` in `requests`,
-   `.danger_accept_invalid_certs(true)` in `reqwest`, etc.) unless
-   verifying against `cert.pem` directly.
+   The cert is self-signed, use `curl -k` or equivalent to accept
+   it, or verify against `cert.pem` directly.
 
 > **Port reachability:** Some cloud providers block inbound ports by
 > default. Configure a firewall / security-group rule to allow traffic
@@ -139,28 +137,16 @@ when binding to a non-loopback address (e.g. `0.0.0.0:8080`).
 
 #### Connecting via a domain name
 
-By default the self-signed cert only identifies itself as
-`flowsurface-server`. If you point a domain at your VPS and want
-clients to actually _verify_ the certificate, set `tls_domain` so the
-cert's Subject Alternative Name matches:
+Set `tls_domain` to have the self-signed cert identify as your domain:
 
 ```toml
 tls_domain = "data.mydomain.com"
 ```
 
-Then connect via `https://data.mydomain.com:{port}` (using the port from
-`bind_address`).
+When binding to `0.0.0.0`, verified TLS requires a domain name (no IP SAN
+is added). When binding to a concrete IP, an IP SAN is added automatically.
 
-Whether verified TLS works via a raw IP depends on the address you bind to:
-
-- **`0.0.0.0` (recommended for remote)** — no IP SAN is added to the
-  cert, so verified TLS requires a domain name (set `tls_domain`).
-  Raw-IP connections are not supported for verified TLS.
-- **A concrete IP** (e.g. `192.168.1.1:8080`) — an IP SAN is
-  automatically included, so verified TLS works via that IP directly.
-
-The cert's SHA-256 fingerprint (hex and `sha256$...`) is logged at
-startup for pinning.
+The cert's SHA-256 fingerprint is logged at startup for pinning.
 
 ### Local development
 
