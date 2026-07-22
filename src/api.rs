@@ -428,7 +428,7 @@ async fn rate_limit_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if let Some(ref limiter) = state.rate_limiter
-        && !limiter.check(peer_addr.ip())
+        && !limiter.check(peer_addr.ip()).await
     {
         tracing::warn!(
             "Rate limit exceeded for {} on {}",

@@ -16,15 +16,25 @@ use futures::{StreamExt, stream::BoxStream, stream::select_all};
 /// the slowest lagged receiver starts dropping messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
+/// Capacity of the channel from exchange stream tasks to the event
+/// router.  When full, events are dropped and a warning is logged
+/// once — the server self-heals when backpressure subsides.
+const EVENT_CHANNEL_CAPACITY: usize = 1_000_000;
+
+/// Capacity of the channel from the event router to the batch
+/// flusher.  Together with `DataBuffer` this provides two layers
+/// of backpressure before data loss.
+const PERSIST_CHANNEL_CAPACITY: usize = 500_000;
+
 /// Aggregates all outbound channels for market-data events.
 ///
 /// Both channels carry raw [`Event`]s — no variant-specific typing
 /// until the final consumer.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct EventOutlets {
-    /// Persist channel (never drops).  Single consumer — the
-    /// persister in `storage.rs`.
-    persist: Option<mpsc::UnboundedSender<Event>>,
+    /// Persist channel (bounded; drops when full to prevent OOM).
+    /// Single consumer — the persister in `storage.rs`.
+    persist: Option<mpsc::Sender<Event>>,
     /// Best-effort fan-out to WebSocket API, alerters, etc.
     broadcast: Option<broadcast::Sender<Event>>,
 }
@@ -37,7 +47,7 @@ impl EventOutlets {
         }
     }
 
-    fn with_persist(mut self, tx: mpsc::UnboundedSender<Event>) -> Self {
+    fn with_persist(mut self, tx: mpsc::Sender<Event>) -> Self {
         self.persist = Some(tx);
         self
     }
@@ -49,11 +59,9 @@ impl EventOutlets {
 
     /// Handle every [`Event`] from the stream engine and route it to
     /// whichever outlets are configured.
-    async fn route(
-        self,
-        mut event_rx: mpsc::UnboundedReceiver<Event>,
-        shutdown: CancellationToken,
-    ) {
+    async fn route(self, mut event_rx: mpsc::Receiver<Event>, shutdown: CancellationToken) {
+        let mut persist_full_warned = false;
+
         loop {
             tokio::select! {
                 biased;
@@ -76,9 +84,31 @@ impl EventOutlets {
                                 let _ = tx.send(event.clone());
                             }
 
-                            if let Some(ref tx) = self.persist && tx.send(event).is_err() {
-                                tracing::info!("Persist channel closed, stopping handler");
-                                return;
+                            if let Some(ref tx) = self.persist {
+                                match tx.try_send(event) {
+                                    Ok(()) => {
+                                        if persist_full_warned {
+                                            tracing::info!(
+                                                "Persist channel recovered — no longer dropping events"
+                                            );
+                                            persist_full_warned = false;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        if !persist_full_warned {
+                                            tracing::warn!(
+                                                "Persist channel full ({} events) — \
+                                                 dropping events until backpressure subsides",
+                                                PERSIST_CHANNEL_CAPACITY,
+                                            );
+                                            persist_full_warned = true;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        tracing::info!("Persist channel closed, stopping handler");
+                                        return;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -109,7 +139,7 @@ pub struct StreamManager {
 #[derive(Default)]
 pub struct StreamReceivers {
     /// Persist channel — carries every [`Event`] as-is.
-    pub persist: Option<mpsc::UnboundedReceiver<Event>>,
+    pub persist: Option<mpsc::Receiver<Event>>,
 }
 
 impl StreamManager {
@@ -122,7 +152,7 @@ impl StreamManager {
         pairs: &[TickerInfo],
         shutdown: CancellationToken,
     ) -> (Self, StreamReceivers) {
-        let (persist_tx, persist_rx) = mpsc::unbounded_channel();
+        let (persist_tx, persist_rx) = mpsc::channel(PERSIST_CHANNEL_CAPACITY);
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
 
         let mut all_streams: Vec<StreamKind> = Vec::with_capacity(pairs.len());
@@ -132,7 +162,7 @@ impl StreamManager {
 
         // Low-level per-exchange WebSocket tasks.
         let (event_rx, stream_tasks) = {
-            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
             let mut by_exchange: HashMap<Exchange, Vec<StreamKind>> = HashMap::new();
             for stream in &all_streams {
@@ -215,7 +245,7 @@ async fn run_exchange_streams(
     handles: AdapterHandles,
     exchange: Exchange,
     streams: Vec<StreamKind>,
-    tx: mpsc::UnboundedSender<Event>,
+    tx: mpsc::Sender<Event>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // Separate streams by kind so we can build the right StreamConfig.
@@ -276,6 +306,7 @@ async fn run_exchange_streams(
     }
 
     let mut merged = select_all(box_streams);
+    let mut channel_full_warned = false;
 
     loop {
         tokio::select! {
@@ -287,9 +318,31 @@ async fn run_exchange_streams(
             event = merged.next() => {
                 match event {
                     Some(event) => {
-                        if tx.send(event).is_err() {
-                            tracing::info!(%exchange, "Event channel closed, stopping stream engine");
-                            break;
+                        match tx.try_send(event) {
+                            Ok(()) => {
+                                if channel_full_warned {
+                                    tracing::info!(
+                                        %exchange,
+                                        "Event channel recovered — no longer dropping events"
+                                    );
+                                    channel_full_warned = false;
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                if !channel_full_warned {
+                                    tracing::warn!(
+                                        %exchange,
+                                        "Event channel full ({} events) — \
+                                         dropping events for {exchange}",
+                                        EVENT_CHANNEL_CAPACITY,
+                                    );
+                                    channel_full_warned = true;
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::info!(%exchange, "Event channel closed, stopping stream engine");
+                                break;
+                            }
                         }
                     }
                     None => {

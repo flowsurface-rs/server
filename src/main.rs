@@ -274,6 +274,12 @@ impl AppHandles {
             if let Some(mgr) = self.stream_mgr.take() {
                 mgr.shutdown().await;
             }
+
+            // Background cleanup (may be mid-VACUUM — let it finish).
+            let _ = self._cleanup.await;
+
+            // Axum server.
+            let _ = self._server.await;
         })
         .await
         .ok();
