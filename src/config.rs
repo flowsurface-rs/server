@@ -352,8 +352,7 @@ impl Config {
 /// A Bearer token used to authenticate API requests.
 ///
 /// Constructed via [`FromStr`] (or [`BearerToken::new`]) which rejects
-/// empty strings.  The [`Display`] implementation outputs `[REDACTED]`
-/// to prevent accidental leakage in logs.
+/// empty strings.  The [`Display`] implementation outputs `[REDACTED]`.
 ///
 /// # Example
 ///
@@ -365,6 +364,9 @@ impl Config {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct BearerToken(String);
+
+/// The expected prefix before the token value.
+const BEARER_PREFIX: &str = "Bearer ";
 
 impl BearerToken {
     /// Create a new `BearerToken`, returning `None` if `raw` is empty.
@@ -379,14 +381,45 @@ impl BearerToken {
     /// Check whether `authorization_header` matches `"Bearer {token}"`
     /// (case-insensitive).
     pub fn is_valid_authorization(&self, authorization_header: &str) -> bool {
-        let expected = format!("Bearer {}", self.0);
-        authorization_header.eq_ignore_ascii_case(&expected)
+        let header = authorization_header.as_bytes();
+        let expected_len = BEARER_PREFIX.len() + self.0.len();
+
+        // Length is not a secret (the token length is always 64 hex chars).
+        if header.len() != expected_len {
+            return false;
+        }
+
+        // "Bearer " prefix is public knowledge — we can short-circuit safely.
+        if !header[..BEARER_PREFIX.len()].eq_ignore_ascii_case(BEARER_PREFIX.as_bytes()) {
+            return false;
+        }
+
+        // Constant-time comparison of the token itself.
+        let token_start = BEARER_PREFIX.len();
+        constant_time_eq_ignore_ascii_case(&header[token_start..], self.0.as_bytes())
     }
 
     /// Return the raw token string (for writing to disk, etc.).
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Compare two byte slices in **constant time** (case-insensitive ASCII).
+///
+/// Every byte position is always compared — the function does **not**
+/// short-circuit on the first mismatch.
+fn constant_time_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "constant_time_eq_ignore_ascii_case requires equal-length slices"
+    );
+    let mut result: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
+    }
+    result == 0
 }
 
 impl FromStr for BearerToken {

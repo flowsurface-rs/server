@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
@@ -19,18 +19,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::BearerToken,
-    limiter::RateLimiter,
+    limiter::{
+        AdmissionGate, ConnectionLimiter, LimiterAcceptor, MAX_CONCURRENT_CONNECTIONS, RateLimiter,
+    },
     storage::{PairInfo, Storage},
 };
+
+/// Static body for 503 responses from the admission gate.
+static GATE_BUDGET_EXHAUSTED: &str = r#"{"error":"server busy, try again later"}"#;
+
+/// Static body for 429 responses
+static RATE_LIMITED: &str = r#"{"error":"rate limit exceeded, slow down"}"#;
 
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Response {
-    Status {
-        status: &'static str,
-        uptime_secs: u64,
-        db_ok: bool,
-    },
     Pairs {
         pairs: Vec<PairInfo>,
         tracked_count: usize,
@@ -38,9 +41,22 @@ enum Response {
     Trades {
         trades: Vec<AnnotatedTrade>,
     },
-    Exchanges {
-        exchanges: HashMap<String, Vec<String>>,
-    },
+}
+
+/// Pre-serialised response bodies for endpoints whose output is either
+/// immutable or infrequently changing.
+pub struct CachedResponses {
+    /// `/status` — cached JSON body with a ~1 second TTL.  Wrapped in a
+    /// `Mutex` because the cache is refreshed on expiry.
+    status: Mutex<StatusCache>,
+    /// `/exchanges` — computed once at startup, never changes.
+    exchanges: String,
+}
+
+/// Inner state for the cached `/status` response.
+struct StatusCache {
+    body: String,
+    refreshed_at: Instant,
 }
 
 /// A normalized trade record, used both in-memory and serialized to JSON.
@@ -124,14 +140,17 @@ pub struct Server {
     /// The tickers configured at startup.
     /// Used by `/pairs` to include pairs that have not yet received trades.
     pub configured_pairs: Vec<Ticker>,
-    /// All available ticker symbols per exchange, from the metadata cache.
-    /// Used by `/exchanges` to help users discover correct suffix patterns.
-    pub available_tickers: HashMap<String, Vec<String>>,
     /// TLS configuration for the HTTPS server (self-signed).
     /// `None` on loopback addresses (plain HTTP), `Some` for remote binds.
     pub tls_config: Option<RustlsConfig>,
     /// Per-IP rate limiter.  `None` when rate limiting is disabled.
     pub rate_limiter: Option<RateLimiter>,
+    /// Admission gate that throttles unknown IPs to a small global budget.
+    pub admission_gate: AdmissionGate,
+    /// Connection‑level cap that prevents TCP/TLS connection‑storm.
+    pub connection_limiter: ConnectionLimiter,
+    /// Cached pre-serialised response bodies for `/status` and `/exchanges`.
+    pub cached: CachedResponses,
 }
 
 impl Server {
@@ -139,18 +158,36 @@ impl Server {
         storage: Storage,
         auth_token: Option<BearerToken>,
         configured_pairs: Vec<Ticker>,
-        available_tickers: HashMap<String, Vec<String>>,
+        available_tickers: &HashMap<String, Vec<String>>,
         tls_config: Option<RustlsConfig>,
         rate_limiter: Option<RateLimiter>,
+        admission_gate: AdmissionGate,
     ) -> Self {
+        // Pre-serialise the /exchanges response — available tickers are
+        // immutable after startup, so we compute this once and avoid
+        // cloning + serialising the HashMap on every request.
+        let cached_exchanges_json =
+            serde_json::to_string(&serde_json::json!({ "exchanges": available_tickers }))
+                .unwrap_or_else(|_| r#"{"exchanges":{}}"#.to_string());
+
+        let connection_limiter = ConnectionLimiter::new(MAX_CONCURRENT_CONNECTIONS);
+
         Self {
             storage,
             startup: Instant::now(),
             auth_token,
             configured_pairs,
-            available_tickers,
             tls_config,
             rate_limiter,
+            admission_gate,
+            connection_limiter,
+            cached: CachedResponses {
+                status: Mutex::new(StatusCache {
+                    body: String::new(),
+                    refreshed_at: Instant::now(),
+                }),
+                exchanges: cached_exchanges_json,
+            },
         }
     }
 
@@ -215,15 +252,55 @@ impl Server {
     ///
     /// Returns server uptime and a basic DB connectivity check.
     /// Suitable for load-balancer / container health probes.
+    ///
+    /// The response is cached for ~1 second to avoid a DB query (and full
+    /// serialization) on every health-check request.
     async fn status(State(state): State<Arc<Self>>) -> impl IntoResponse {
+        // Fast path: serve from cache if fresh (< 1 second old).
+        {
+            let cache = state.cached.status.lock().unwrap();
+            if !cache.body.is_empty()
+                && Instant::now()
+                    .saturating_duration_since(cache.refreshed_at)
+                    .as_secs()
+                    < 1
+            {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    cache.body.clone(),
+                )
+                    .into_response();
+            }
+        }
+
+        // Slow path: query the DB, build response, update cache.
         let uptime = state.startup.elapsed().as_secs();
         let db_ok = state.storage.pair_count().is_ok();
+        let body = match serde_json::to_string(&serde_json::json!({
+            "status": "ok",
+            "uptime_secs": uptime,
+            "db_ok": db_ok,
+        })) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!("Failed to serialise status: {e:#}");
+                return Self::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+            }
+        };
 
-        Self::json_ok(&Response::Status {
-            status: "ok",
-            uptime_secs: uptime,
-            db_ok,
-        })
+        {
+            let mut cache = state.cached.status.lock().unwrap();
+            cache.body = body.clone();
+            cache.refreshed_at = Instant::now();
+        }
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
     }
 
     /// GET /exchanges
@@ -231,10 +308,16 @@ impl Server {
     /// Returns all available ticker symbols per exchange, as discovered from
     /// the exchange APIs at startup.  Useful for discovering the correct suffix
     /// patterns when configuring `config.toml`.
+    ///
+    /// The response body is pre-serialised once at startup (the data is
+    /// immutable), so this handler only does a cheap `String` clone.
     async fn exchanges(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        Self::json_ok(&Response::Exchanges {
-            exchanges: state.available_tickers.clone(),
-        })
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            state.cached.exchanges.clone(),
+        )
+            .into_response()
     }
 
     /// GET /pairs
@@ -353,17 +436,40 @@ impl Server {
     ///
     /// Uses plain HTTP for loopback addresses, HTTPS with a self-signed
     /// certificate for non-loopback (remote) binds.  Exits on bind failure.
+    ///
+    /// Middleware execution order (outermost → innermost):
+    ///
+    ///   1. **Priority gate** — throttles unknown IPs to a tiny global budget
+    ///      (10 req/s) so scanners consume almost no CPU.
+    ///   2. **Auth** — Bearer token verification for protected routes.
+    ///   3. **Per-IP rate limiter** — token-bucket per IP (default 500 req/10s).
+    ///      Only reached by authenticated requests — unauthenticated requests are
+    ///      rejected by auth first, so they never consume rate-limiter bookkeeping.
+    ///
+    /// `/status` is public (no auth) but still goes through the priority gate
+    /// and its response is cached to avoid a DB hit on every health check.
+    ///
+    /// **Connection‑level DoS protection:** both the TLS and plain‑HTTP paths
+    /// use `axum_server` with a [`LimiterAcceptor`] that caps concurrent
+    /// connections at [`MAX_CONCURRENT_CONNECTIONS`] (default 512).  Once the
+    /// ceiling is hit, new connections are dropped immediately (TCP reset).
     pub async fn serve(self: Arc<Self>, bind_address: SocketAddr) -> tokio::task::JoinHandle<()> {
         let tls_config = self.tls_config.clone();
+        let limiter = self.connection_limiter.clone();
 
-        // Public routes — no auth required
+        // Public route — /status is rate-gated but NOT auth-gated.
         let public = Router::new()
             .route("/status", get(Server::status))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                priority_gate_middleware,
+            ))
             .with_state(self.clone());
 
-        // Protected routes — require Bearer token when auth is configured.
-        // Rate limiting is the outermost layer so abusive clients are dropped
-        // before we spend cycles verifying their token.
+        // Protected routes — require auth.
+        // Layer order: outermost = priority gate, then auth,
+        // then rate limiter (innermost).  Rate limiter is after auth
+        // so unauthenticated requests never consume rate-limit state.
         let protected = Router::new()
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
@@ -377,50 +483,62 @@ impl Server {
                 self.clone(),
                 auth_middleware,
             ))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                priority_gate_middleware,
+            ))
             .with_state(self);
 
         let router = public.merge(protected);
 
         tokio::spawn(async move {
-            if let Some(cfg) = tls_config {
-                tracing::info!("Starting HTTPS API on {bind_address}");
-                if let Err(e) = axum_server::bind_rustls(bind_address, cfg)
-                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                {
-                    tracing::error!("HTTPS server error on {bind_address}: {e:#}");
+            // Bind synchronously for both paths — axum_server needs a
+            // std::net::TcpListener regardless of TLS.
+            let std_listener = match std::net::TcpListener::bind(bind_address) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to bind {bind_address}: {e:#}. \
+                         Server will not accept connections."
+                    );
+                    return;
                 }
+            };
+            let _ = std_listener.set_nonblocking(true);
+
+            let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
+
+            // Both code paths share the same structure: create an
+            // axum_server, wrap its acceptor with the connection
+            // limiter, then serve.
+            let result = if let Some(cfg) = tls_config {
+                tracing::info!("Starting HTTPS API on {bind_address}");
+                axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
+                    .map(|acceptor| LimiterAcceptor {
+                        inner: acceptor,
+                        limiter: limiter.clone(),
+                    })
+                    .serve(make_svc)
+                    .await
             } else {
                 tracing::info!("Starting HTTP API on {bind_address}");
-                let listener = match tokio::net::TcpListener::bind(bind_address).await {
-                    Ok(listener) => listener,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to bind to {bind_address}: {e:#}. \
-                             Server will not accept connections."
-                        );
-                        return;
-                    }
-                };
-                if let Err(e) = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                {
-                    tracing::error!("HTTP server error on {bind_address}: {e:#}");
-                }
+                axum_server::from_tcp(std_listener)
+                    .map(|acceptor| LimiterAcceptor {
+                        inner: acceptor,
+                        limiter: limiter.clone(),
+                    })
+                    .serve(make_svc)
+                    .await
+            };
+
+            if let Err(e) = result {
+                tracing::error!("Server error on {bind_address}: {e:#}");
             }
         })
     }
 }
 
-/// Static body for 429 responses
-static RATE_LIMIT_BODY: &str = r#"{"error":"rate limit exceeded, slow down"}"#;
-
 /// Axum middleware that enforces per-IP rate limits.
-/// Applied before auth so abusive clients are dropped without
-/// spending cycles on token verification.
 async fn rate_limit_middleware(
     State(state): State<Arc<Server>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -438,15 +556,18 @@ async fn rate_limit_middleware(
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::CONTENT_TYPE, "application/json")],
-            RATE_LIMIT_BODY,
+            RATE_LIMITED,
         )
             .into_response();
     }
     next.run(req).await
 }
 
-/// Thin axum middleware that delegates auth checking to `Server::check_auth`.
+/// Axum middleware that delegates auth checking to `Server::check_auth`.
 /// Returns a JSON error body on auth failure for consistency with the rest of the API.
+///
+/// On success the peer's IP is **marked as trusted** so future requests from
+/// that IP skip the priority admission gate entirely.
 async fn auth_middleware(
     State(state): State<Arc<Server>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -454,8 +575,37 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Err((status, msg)) = state.check_auth(&headers, peer_addr) {
-        return Server::json_err(status, msg);
+    if state.auth_token.is_some() {
+        if let Err((status, msg)) = state.check_auth(&headers, peer_addr) {
+            return Server::json_err(status, msg);
+        }
+        state.admission_gate.mark_trusted(peer_addr.ip()).await;
+    }
+    next.run(req).await
+}
+
+/// Axum middleware that applies the priority admission gate.
+///
+/// IPs that have previously authenticated successfully bypass the gate
+/// entirely, the per-IP rate limiter (inner layer) is their ceiling.
+async fn priority_gate_middleware(
+    State(state): State<Arc<Server>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !state.admission_gate.admit(peer_addr.ip()).await {
+        tracing::warn!(
+            "Admission gate blocked {} on {} (global budget exhausted)",
+            peer_addr.ip(),
+            req.uri().path(),
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            GATE_BUDGET_EXHAUSTED,
+        )
+            .into_response();
     }
     next.run(req).await
 }

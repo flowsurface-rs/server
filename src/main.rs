@@ -21,7 +21,7 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
 use crate::config::{Args, BearerToken, Config};
-use crate::limiter::RateLimiter;
+use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -211,13 +211,21 @@ impl App {
             self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
 
         let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
+        let admission_gate = AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP);
+        if self.auth_token.is_some() {
+            tracing::info!(
+                "Admission gate active: {ADMISSION_PER_IP_BUDGET} req/s per unknown IP, \
+                 max {ADMISSION_GLOBAL_CAP} req/s total; authenticated IPs bypass the gate",
+            );
+        }
         let server = Arc::new(Server::new(
             self.storage,
             self.auth_token,
             configured_pairs,
-            available_tickers,
+            &available_tickers,
             self.tls_config,
             self.rate_limiter,
+            admission_gate,
         ));
         let server_handle = server.serve(self.bind_address).await;
 
