@@ -1,17 +1,21 @@
-use anyhow::{Context, Result};
-use duckdb::Connection;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use crate::api::{AnnotatedTrade, TradeQuery};
+use crate::config::{RetentionHours, StorageBytes};
+use crate::stream;
 
 use flowsurface_exchange::adapter::{Event, Exchange};
 use flowsurface_exchange::unit::{price::Price, qty::Qty};
 use flowsurface_exchange::{Ticker, TickerInfo, UnixMs};
 
-use crate::api::{AnnotatedTrade, TradeQuery};
-use crate::config::{RetentionHours, StorageBytes};
-use crate::stream;
+use anyhow::{Context, Result};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use axum::http::StatusCode;
+use duckdb::Connection;
 use tokio::task::JoinHandle;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -46,7 +50,12 @@ impl Storage {
     /// all sub-connections (readers and the batch writer) must be obtained
     /// via [`open_writer`](Self::open_writer) / [`connection`](Self::connection)
     /// so they share the same database instance.
-    pub fn open(data_dir: &Path) -> Result<Self> {
+    pub fn open(
+        data_dir: &Path,
+        memory_limit_mb: u64,
+        threads: u64,
+        max_storage_mb: u64,
+    ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data directory {}", data_dir.display()))?;
 
@@ -83,6 +92,29 @@ impl Storage {
             );",
         )
         .context("creating DuckDB schema")?;
+
+        // Max temp directory size: 20% of the main storage cap, clamped to
+        // [512 MiB, 4096 MiB].  When max_storage_mb is 0 (unlimited) we
+        // use the ceiling as the reference point.
+        let max_temp_mb = {
+            let base = if max_storage_mb == 0 {
+                4096
+            } else {
+                max_storage_mb
+            };
+            ((base as f64 * 0.20) as u64).clamp(512, 4096)
+        };
+
+        let mut pragmas: Vec<String> = vec!["SET enable_external_access = false;".to_string()];
+        if memory_limit_mb > 0 {
+            pragmas.push(format!("SET memory_limit = '{memory_limit_mb}MB';"));
+        }
+        if threads > 0 {
+            pragmas.push(format!("SET threads = {threads};"));
+        }
+        pragmas.push(format!("SET max_temp_directory_size = '{max_temp_mb}MB';"));
+        root.execute_batch(&pragmas.join(" "))
+            .context("applying DuckDB resource limits")?;
 
         Ok(Self {
             db: Arc::new(parking_lot::Mutex::new(root)),
@@ -279,7 +311,7 @@ impl Storage {
     pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
         let conn = self.connection()?;
 
-        let limit = q.limit.unwrap_or(100_000).min(1_000_000);
+        let limit = q.limit.unwrap_or(50_000).min(400_000);
         let exchange = q.exchange_filter();
         let symbol_lower = q.symbol.to_lowercase();
 
@@ -312,36 +344,26 @@ impl Storage {
 
         let mut stmt = conn.prepare(&sql).context("preparing Arrow IPC query")?;
 
-        let batches: Vec<arrow::record_batch::RecordBatch> = stmt
-            .query_arrow(&params[..])
-            .context("executing Arrow query")?
-            .collect();
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("qty", DataType::Float64, false),
+            Field::new("is_sell", DataType::Boolean, false),
+        ]));
 
-        // Drop the statement so the connection is free for the IPC writer.
-        drop(stmt);
-
-        let mut buf = Vec::new();
+        let mut buf = Vec::with_capacity(4096);
+        let mut batch_count = 0usize;
         {
-            use arrow::datatypes::{DataType, Field, Schema};
-            use arrow::ipc::writer::StreamWriter;
-            use std::sync::Arc;
-
-            let schema: Arc<Schema> = if batches.is_empty() {
-                Arc::new(Schema::new(vec![
-                    Field::new("ts", DataType::Int64, false),
-                    Field::new("price", DataType::Float64, false),
-                    Field::new("qty", DataType::Float64, false),
-                    Field::new("is_sell", DataType::Boolean, false),
-                ]))
-            } else {
-                batches[0].schema()
-            };
-
             let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
                 .context("creating Arrow IPC stream writer")?;
 
-            for batch in &batches {
-                writer.write(batch).context("writing Arrow record batch")?;
+            let rows = stmt
+                .query_arrow(&params[..])
+                .context("executing Arrow query")?;
+
+            for batch in rows {
+                writer.write(&batch).context("writing Arrow record batch")?;
+                batch_count += 1;
             }
 
             writer.finish().context("finishing Arrow IPC stream")?;
@@ -350,7 +372,7 @@ impl Storage {
         tracing::debug!(
             "Exported {} bytes of Arrow IPC data ({} batch(es))",
             buf.len(),
-            batches.len()
+            batch_count,
         );
         Ok(buf)
     }
@@ -461,6 +483,37 @@ impl Storage {
             Some(Ok(v)) => Ok(Some(v)),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
+        }
+    }
+
+    /// Run a blocking DuckDB query on the blocking thread pool with a timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err((StatusCode, &'static str))` suitable for `json_err` on:
+    /// - Query failure (the closure returned `Err`)
+    /// - Task panic (`spawn_blocking` panicked)
+    /// - Timeout (the deadline elapsed)
+    pub async fn run_blocking_query<T: Send + 'static>(
+        self,
+        deadline: Duration,
+        label: &str,
+        f: impl FnOnce(Storage) -> anyhow::Result<T> + Send + 'static,
+    ) -> Result<T, (StatusCode, &'static str)> {
+        match tokio::time::timeout(deadline, tokio::task::spawn_blocking(move || f(self))).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(e))) => {
+                tracing::error!("{label} query failed: {e:#}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+            }
+            Ok(Err(join_err)) => {
+                tracing::error!("{label} query task panicked: {join_err:#}");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+            }
+            Err(_) => {
+                tracing::warn!("{label} query timed out after {deadline:?}");
+                Err((StatusCode::SERVICE_UNAVAILABLE, "query timed out"))
+            }
         }
     }
 

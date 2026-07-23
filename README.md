@@ -4,7 +4,7 @@ A trade data collector for crypto markets, with an embedded database and REST AP
 
 - Connects to exchange WebSocket streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange)
 - Persists trades to [DuckDB](https://duckdb.org)
-- Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
+- Serves data via a REST API built with [Axum](https://github.com/tokio-rs/axum), as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
 It's a self-contained, portable server, designed to run on a small VPS for individual use; not for production or shared use.
 
@@ -69,13 +69,11 @@ available options with inline documentation.
 
 ### `[storage]`
 
-| Option                 | Default  | Description                                       |
-| ---------------------- | -------- | ------------------------------------------------- |
-| `data_dir`             | `"data"` | Directory for DB, auth token, and TLS certs.      |
-| `max_storage_mb`       | `4096`   | Hard cap on DB+WAL (MB); `0` = unlimited.         |
-| `data_retention_hours` | `168`    | Purge trades older than this; `0` = keep all.     |
-| `flush_interval_ms`    | `2000`   | Write interval (ms); higher = fewer disk writes.  |
-| `max_buffered_trades`  | `200000` | In-memory buffer cap before dropping (OOM guard). |
+| Option                 | Default  | Description                                   |
+| ---------------------- | -------- | --------------------------------------------- |
+| `data_dir`             | `"data"` | Directory for DB, auth token, and TLS certs.  |
+| `max_storage_mb`       | `4096`   | Hard cap on DB+WAL (MB); `0` = unlimited.     |
+| `data_retention_hours` | `168`    | Purge trades older than this; `0` = keep all. |
 
 ### `[pairs]`
 
@@ -342,6 +340,6 @@ This is ideal for high-volume data transfer to clients that support Arrow native
 | `symbol` | string | **Required.** Ticker symbol (e.g. `btcusdt`) |
 | `from`   | int    | Unix ms lower bound (inclusive)              |
 | `to`     | int    | Unix ms upper bound (inclusive)              |
-| `limit`  | int    | Max records (default 100 000, max 1 000 000) |
+| `limit`  | int    | Max records (default 50 000, max 400 000)    |
 
 > **Sort order:** Same as `/trades`.

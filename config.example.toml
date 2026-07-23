@@ -7,6 +7,7 @@ bind_address = "127.0.0.1:8080"
 # Per-IP token-bucket rate limiter.  Each IP can burst up to
 # `max_requests` requests instantly; sustained throughput is
 # limited to `max_requests / 10` req/s (tokens refill continuously).
+# Loopback addresses always bypass the limiter.
 # Set to 0 to disable entirely (not recommended if the API is
 # exposed to the internet — even for personal use a runaway
 # client can saturate the server).
@@ -36,6 +37,16 @@ max_storage_mb = 4096
 # Set to 0 to keep all trades indefinitely (disk-permitting).
 # Default: 168 (7 days).
 data_retention_hours = 168
+
+# Hard cap on DuckDB in-memory usage.
+# 0 = use DuckDB's default (80% of system RAM).
+# Default: 0 (DuckDB default).
+# memory_limit_mb = 0
+
+# Number of worker threads DuckDB is allowed to use.
+# 0 = use DuckDB's default (all CPU cores).
+# Default: 0 (DuckDB default).
+# threads = 0
 
 # Trade batch-flush interval in milliseconds.
 # Higher values = fewer disk writes (more I/O efficient).

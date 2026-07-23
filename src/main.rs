@@ -21,7 +21,7 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::Server;
 use crate::config::{Args, BearerToken, Config};
-use crate::limiter::RateLimiter;
+use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
 
 #[tokio::main]
@@ -79,7 +79,13 @@ struct App {
 impl App {
     /// Open storage, resolve configured pairs, persist ticker metadata.
     async fn new(config: &Config, data_dir: &Path) -> Self {
-        let storage = Storage::open(data_dir).unwrap_or_else(|e| {
+        let storage = Storage::open(
+            data_dir,
+            config.storage.memory_limit_mb,
+            config.storage.threads,
+            config.storage.max_storage_mb,
+        )
+        .unwrap_or_else(|e| {
             tracing::error!("Failed to initialise storage: {e:#}");
             std::process::exit(1);
         });
@@ -118,7 +124,7 @@ impl App {
             if config.pairs.discovery_mode {
                 tracing::warn!(
                     "No matching pairs for base_assets {:?} with current whitelist \
-                     — discovery mode is on, so /exchanges is still populated.",
+                     - discovery mode is on, so /exchanges is still populated.",
                     config.pairs.base_assets
                 );
             } else {
@@ -136,7 +142,7 @@ impl App {
             resolved_pairs
                 .iter()
                 .map(|ti| ti.exchange())
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<rustc_hash::FxHashSet<_>>()
                 .len()
         );
 
@@ -211,33 +217,43 @@ impl App {
             self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
 
         let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
+        let admission_gate = AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP);
+        if self.auth_token.is_some() {
+            tracing::info!(
+                "Admission gate active: {ADMISSION_PER_IP_BUDGET} req/s per unknown IP, \
+                 max {ADMISSION_GLOBAL_CAP} req/s total; authenticated IPs bypass the gate",
+            );
+        }
         let server = Arc::new(Server::new(
             self.storage,
             self.auth_token,
             configured_pairs,
-            available_tickers,
+            &available_tickers,
             self.tls_config,
             self.rate_limiter,
+            admission_gate,
         ));
-        let server_handle = server.serve(self.bind_address).await;
+        let (server_task, server_shutdown_handle) = server.serve(self.bind_address).await;
 
         AppHandles {
             shutdown,
             stream_mgr: Some(stream_mgr),
             flusher,
             _cleanup,
-            _server: server_handle,
+            _server: server_task,
+            server_shutdown_handle,
         }
     }
 }
 
-/// Runtime handles for the active pipeline — provides ordered shutdown.
+/// Runtime handles for the active pipeline - provides ordered shutdown.
 struct AppHandles {
     shutdown: CancellationToken,
     stream_mgr: Option<stream::StreamManager>,
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
     _server: tokio::task::JoinHandle<()>,
+    server_shutdown_handle: axum_server::Handle,
 }
 
 impl AppHandles {
@@ -267,7 +283,7 @@ impl AppHandles {
 
         // 3. Join everything within the grace period.
         tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
-            // Flusher first — it drains the trade buffer to disk.
+            // Flusher first - it drains the trade buffer to disk.
             let _ = self.flusher.await;
 
             // Streaming tasks (engine + handler).
@@ -275,13 +291,18 @@ impl AppHandles {
                 mgr.shutdown().await;
             }
 
-            // Background cleanup (may be mid-VACUUM — let it finish).
+            // Background cleanup (may be mid-VACUUM - let it finish).
             let _ = self._cleanup.await;
 
-            // Axum server.
+            // Axum server - signal graceful shutdown first so it stops
+            // accepting new connections and drains in-flight requests.
+            self.server_shutdown_handle
+                .graceful_shutdown(Some(std::time::Duration::from_secs(3)));
             let _ = self._server.await;
         })
         .await
         .ok();
+
+        tracing::info!("Shutdown complete.");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +44,7 @@ impl fmt::Display for ConfigMarketKind {
 /// For example `{"binance": {"spot": ["USDT"], "linear": ["USDT", "USDC"]}}`.
 /// The server constructs the correct ticker string per exchange
 /// (handling separators, _PERP, -SWAP suffixes, etc.).
-pub type WhitelistTemplates = HashMap<String, HashMap<ConfigMarketKind, Vec<String>>>;
+pub type WhitelistTemplates = FxHashMap<String, FxHashMap<ConfigMarketKind, Vec<String>>>;
 
 #[derive(Parser)]
 #[command(name = "flowsurface-server", about = "Trade data store daemon")]
@@ -133,6 +133,16 @@ pub struct StorageConfig {
     /// Default: `4096` (4 GiB).
     #[serde(default = "default_max_storage_mb")]
     pub max_storage_mb: u64,
+    /// Hard cap on DuckDB in-memory usage in megabytes.
+    /// `0` means use DuckDB's default (80% of system RAM).
+    /// Default: `1024` (1 GiB).
+    #[serde(default = "default_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// Number of worker threads DuckDB is allowed to use.
+    /// `0` means use DuckDB's default (all CPU cores).
+    /// Default: `4`.
+    #[serde(default = "default_threads")]
+    pub threads: u64,
 }
 
 impl Default for StorageConfig {
@@ -143,6 +153,8 @@ impl Default for StorageConfig {
             data_retention_hours: default_data_retention_hours(),
             max_buffered_trades: default_max_buffered_trades(),
             max_storage_mb: default_max_storage_mb(),
+            memory_limit_mb: default_memory_limit_mb(),
+            threads: default_threads(),
         }
     }
 }
@@ -204,6 +216,14 @@ const fn default_max_buffered_trades() -> usize {
 
 const fn default_max_storage_mb() -> u64 {
     4096
+}
+
+const fn default_memory_limit_mb() -> u64 {
+    0
+}
+
+const fn default_threads() -> u64 {
+    0
 }
 
 impl Config {
@@ -352,8 +372,7 @@ impl Config {
 /// A Bearer token used to authenticate API requests.
 ///
 /// Constructed via [`FromStr`] (or [`BearerToken::new`]) which rejects
-/// empty strings.  The [`Display`] implementation outputs `[REDACTED]`
-/// to prevent accidental leakage in logs.
+/// empty strings.  The [`Display`] implementation outputs `[REDACTED]`.
 ///
 /// # Example
 ///
@@ -365,6 +384,9 @@ impl Config {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct BearerToken(String);
+
+/// The expected prefix before the token value.
+const BEARER_PREFIX: &str = "Bearer ";
 
 impl BearerToken {
     /// Create a new `BearerToken`, returning `None` if `raw` is empty.
@@ -379,14 +401,45 @@ impl BearerToken {
     /// Check whether `authorization_header` matches `"Bearer {token}"`
     /// (case-insensitive).
     pub fn is_valid_authorization(&self, authorization_header: &str) -> bool {
-        let expected = format!("Bearer {}", self.0);
-        authorization_header.eq_ignore_ascii_case(&expected)
+        let header = authorization_header.as_bytes();
+        let expected_len = BEARER_PREFIX.len() + self.0.len();
+
+        // Length is not a secret (the token length is always 64 hex chars).
+        if header.len() != expected_len {
+            return false;
+        }
+
+        // "Bearer " prefix is public knowledge — we can short-circuit safely.
+        if !header[..BEARER_PREFIX.len()].eq_ignore_ascii_case(BEARER_PREFIX.as_bytes()) {
+            return false;
+        }
+
+        // Constant-time comparison of the token itself.
+        let token_start = BEARER_PREFIX.len();
+        constant_time_eq_ignore_ascii_case(&header[token_start..], self.0.as_bytes())
     }
 
     /// Return the raw token string (for writing to disk, etc.).
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Compare two byte slices in **constant time** (case-insensitive ASCII).
+///
+/// Every byte position is always compared — the function does **not**
+/// short-circuit on the first mismatch.
+fn constant_time_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "constant_time_eq_ignore_ascii_case requires equal-length slices"
+    );
+    let mut result: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
+    }
+    result == 0
 }
 
 impl FromStr for BearerToken {
