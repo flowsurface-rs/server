@@ -135,12 +135,12 @@ pub struct StorageConfig {
     pub max_storage_mb: u64,
     /// Hard cap on DuckDB in-memory usage in megabytes.
     /// `0` means use DuckDB's default (80% of system RAM).
-    /// Default: `1024` (1 GiB).
+    /// Default: `0`.
     #[serde(default = "default_memory_limit_mb")]
     pub memory_limit_mb: u64,
     /// Number of worker threads DuckDB is allowed to use.
     /// `0` means use DuckDB's default (all CPU cores).
-    /// Default: `4`.
+    /// Default: `0`.
     #[serde(default = "default_threads")]
     pub threads: u64,
 }

@@ -1,10 +1,10 @@
 # flowsurface-server
 
-A trade data collector for crypto markets, with an embedded database and REST API.
+A trade data collector for crypto markets, with an embedded database and a REST API.
 
 - Connects to exchange WebSocket streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange)
 - Persists trades to [DuckDB](https://duckdb.org)
-- Serves data via a REST API built with [Axum](https://github.com/tokio-rs/axum), as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
+- Serves data via REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
 It's a self-contained, portable server, designed to run on a small VPS for individual use; not for production or shared use.
 
@@ -42,11 +42,11 @@ cargo build --release
 cp config.example.toml config.toml
 
 # run
-./target/release/flowsurface-server
+cargo run --release
 ```
 
 By default the server looks for `config.toml` in the project root when the
-executable path contains `/target/` (development); otherwise it looks next
+executable path contains `/target/`; otherwise it looks next
 to the executable (deployed binary). Use `--config /path/to/config.toml` to
 override.
 
@@ -61,11 +61,10 @@ available options with inline documentation.
 
 ### `[network]`
 
-| Option         | Default                | Description                                      |
-| -------------- | ---------------------- | ------------------------------------------------ |
-| `bind_address` | `127.0.0.1:8080`       | Listen address; non-loopback enables TLS + auth. |
-| `max_requests` | `500`                  | Per-IP rate limit (req/10s); `0` = off.          |
-| `tls_domain`   | `"flowsurface-server"` | Domain name for the self-signed TLS cert's SAN.  |
+| Option         | Default          | Description                                      |
+| -------------- | ---------------- | ------------------------------------------------ |
+| `bind_address` | `127.0.0.1:8080` | Listen address; non-loopback enables TLS + auth. |
+| `max_requests` | `500`            | Per-IP rate limit (req/10s); `0` = off.          |
 
 ### `[storage]`
 
@@ -153,6 +152,29 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 - Plain HTTP (no TLS overhead)
 - No auth token required
 - `curl http://127.0.0.1:8080/pairs` works directly
+
+## Design limitations
+
+This server is not a tick-by-tick market data recorder and shouldn't be
+treated as one:
+
+- **No delivery guarantees**: WebSocket disconnections may cause gaps.
+  Exchange-side replays may introduce duplicates. The server uses
+  [flowsurface-exchange](https://github.com/flowsurface-rs/flowsurface/tree/main/exchange)
+  for market feeds, which is built for charting rather than archival.
+
+- **In-memory buffering**: trades are held in memory for up to
+  `flush_interval_ms` (default 2s) before batch-writing to DuckDB.
+  Under extreme load, if the buffer exceeds `max_buffered_trades`,
+  the oldest entries are shed to prevent OOM crashes.
+
+- **Configuration changes require a restart**: editing tracked pairs
+  or anything in `config.toml` needs a server restart. In-memory
+  buffered trades are flushed to disk during shutdown, but there
+  will be a data gap until the server restarts and feeds reconnect.
+
+It prioritizes **convenience** over guaranteed delivery, as it's simply
+made as a companion for [flowsurface](https://github.com/flowsurface-rs/flowsurface).
 
 ## API endpoints
 
