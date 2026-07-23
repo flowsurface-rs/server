@@ -79,7 +79,13 @@ struct App {
 impl App {
     /// Open storage, resolve configured pairs, persist ticker metadata.
     async fn new(config: &Config, data_dir: &Path) -> Self {
-        let storage = Storage::open(data_dir).unwrap_or_else(|e| {
+        let storage = Storage::open(
+            data_dir,
+            config.storage.memory_limit_mb,
+            config.storage.threads,
+            config.storage.max_storage_mb,
+        )
+        .unwrap_or_else(|e| {
             tracing::error!("Failed to initialise storage: {e:#}");
             std::process::exit(1);
         });

@@ -133,6 +133,16 @@ pub struct StorageConfig {
     /// Default: `4096` (4 GiB).
     #[serde(default = "default_max_storage_mb")]
     pub max_storage_mb: u64,
+    /// Hard cap on DuckDB in-memory usage in megabytes.
+    /// `0` means use DuckDB's default (80% of system RAM).
+    /// Default: `1024` (1 GiB).
+    #[serde(default = "default_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+    /// Number of worker threads DuckDB is allowed to use.
+    /// `0` means use DuckDB's default (all CPU cores).
+    /// Default: `4`.
+    #[serde(default = "default_threads")]
+    pub threads: u64,
 }
 
 impl Default for StorageConfig {
@@ -143,6 +153,8 @@ impl Default for StorageConfig {
             data_retention_hours: default_data_retention_hours(),
             max_buffered_trades: default_max_buffered_trades(),
             max_storage_mb: default_max_storage_mb(),
+            memory_limit_mb: default_memory_limit_mb(),
+            threads: default_threads(),
         }
     }
 }
@@ -204,6 +216,14 @@ const fn default_max_buffered_trades() -> usize {
 
 const fn default_max_storage_mb() -> u64 {
     4096
+}
+
+const fn default_memory_limit_mb() -> u64 {
+    0
+}
+
+const fn default_threads() -> u64 {
+    0
 }
 
 impl Config {

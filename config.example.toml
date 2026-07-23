@@ -37,6 +37,16 @@ max_storage_mb = 4096
 # Default: 168 (7 days).
 data_retention_hours = 168
 
+# Hard cap on DuckDB in-memory usage.
+# 0 = use DuckDB's default (80% of system RAM).
+# Default: 0 (DuckDB default).
+# memory_limit_mb = 0
+
+# Number of worker threads DuckDB is allowed to use.
+# 0 = use DuckDB's default (all CPU cores).
+# Default: 0 (DuckDB default).
+# threads = 0
+
 # Trade batch-flush interval in milliseconds.
 # Higher values = fewer disk writes (more I/O efficient).
 # Lower values = trades appear in the DB sooner (at more write cost).

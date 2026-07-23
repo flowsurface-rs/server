@@ -50,7 +50,12 @@ impl Storage {
     /// all sub-connections (readers and the batch writer) must be obtained
     /// via [`open_writer`](Self::open_writer) / [`connection`](Self::connection)
     /// so they share the same database instance.
-    pub fn open(data_dir: &Path) -> Result<Self> {
+    pub fn open(
+        data_dir: &Path,
+        memory_limit_mb: u64,
+        threads: u64,
+        max_storage_mb: u64,
+    ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data directory {}", data_dir.display()))?;
 
@@ -87,6 +92,29 @@ impl Storage {
             );",
         )
         .context("creating DuckDB schema")?;
+
+        // Max temp directory size: 20% of the main storage cap, clamped to
+        // [512 MiB, 4096 MiB].  When max_storage_mb is 0 (unlimited) we
+        // use the ceiling as the reference point.
+        let max_temp_mb = {
+            let base = if max_storage_mb == 0 {
+                4096
+            } else {
+                max_storage_mb
+            };
+            ((base as f64 * 0.20) as u64).clamp(512, 4096)
+        };
+
+        let mut pragmas: Vec<String> = vec!["SET enable_external_access = false;".to_string()];
+        if memory_limit_mb > 0 {
+            pragmas.push(format!("SET memory_limit = '{memory_limit_mb}MB';"));
+        }
+        if threads > 0 {
+            pragmas.push(format!("SET threads = {threads};"));
+        }
+        pragmas.push(format!("SET max_temp_directory_size = '{max_temp_mb}MB';"));
+        root.execute_batch(&pragmas.join(" "))
+            .context("applying DuckDB resource limits")?;
 
         Ok(Self {
             db: Arc::new(parking_lot::Mutex::new(root)),
@@ -283,7 +311,7 @@ impl Storage {
     pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
         let conn = self.connection()?;
 
-        let limit = q.limit.unwrap_or(100_000).min(400_000);
+        let limit = q.limit.unwrap_or(50_000).min(400_000);
         let exchange = q.exchange_filter();
         let symbol_lower = q.symbol.to_lowercase();
 

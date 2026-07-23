@@ -411,7 +411,7 @@ impl Server {
             return Server::json_err(StatusCode::BAD_REQUEST, &msg);
         }
 
-        let limit = query.limit.unwrap_or(100_000).min(400_000);
+        let limit = query.limit.unwrap_or(50_000).min(400_000);
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 
@@ -535,13 +535,13 @@ impl Server {
                         limiter: limiter.clone(),
                     });
 
-                // HTTP/1: 10 s to read request headers; cap headers at 100.
                 server
                     .http_builder()
                     .http1()
                     .header_read_timeout(Duration::from_secs(10))
-                    .max_headers(100);
-                // HTTP/2: PING every 30 s; drop if no response in 5 s.
+                    .max_headers(100)
+                    .keep_alive(false);
+
                 server
                     .http_builder()
                     .http2()
@@ -562,7 +562,8 @@ impl Server {
                     .http_builder()
                     .http1()
                     .header_read_timeout(Duration::from_secs(10))
-                    .max_headers(100);
+                    .max_headers(100)
+                    .keep_alive(false);
 
                 server
                     .http_builder()

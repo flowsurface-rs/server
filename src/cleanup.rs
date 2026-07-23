@@ -91,6 +91,15 @@ impl CleanupScheduler {
     ///
     /// Returns an error when the storage size cannot be read at all.
     pub fn new(storage: &Storage, config: CleanupConfig) -> anyhow::Result<Self> {
+        if config.retention_hours.as_hours() > 0 {
+            tracing::info!(
+                "Data retention enabled: trades older than {}h ({} days) \
+                 will be purged during cleanup cycles.",
+                config.retention_hours.as_hours(),
+                config.retention_hours.as_hours() / 24,
+            );
+        };
+
         if let Some(max) = config.max_storage_bytes {
             tracing::info!(
                 "Storage hard cap enabled: {} MB (will purge oldest trades when exceeded)",
