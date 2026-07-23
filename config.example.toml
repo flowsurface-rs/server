@@ -7,6 +7,7 @@ bind_address = "127.0.0.1:8080"
 # Per-IP token-bucket rate limiter.  Each IP can burst up to
 # `max_requests` requests instantly; sustained throughput is
 # limited to `max_requests / 10` req/s (tokens refill continuously).
+# Loopback addresses always bypass the limiter.
 # Set to 0 to disable entirely (not recommended if the API is
 # exposed to the internet — even for personal use a runaway
 # client can saturate the server).

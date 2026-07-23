@@ -4,7 +4,7 @@ A trade data collector for crypto markets, with an embedded database and REST AP
 
 - Connects to exchange WebSocket streams via [flowsurface-exchange](https://crates.io/crates/flowsurface-exchange)
 - Persists trades to [DuckDB](https://duckdb.org)
-- Serves data via a REST API, as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
+- Serves data via a REST API built with [Axum](https://github.com/tokio-rs/axum), as JSON or [Arrow IPC](https://arrow.apache.org/) stream formats
 
 It's a self-contained, portable server, designed to run on a small VPS for individual use; not for production or shared use.
 
