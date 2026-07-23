@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -259,7 +260,7 @@ impl Server {
     async fn status(State(state): State<Arc<Self>>) -> impl IntoResponse {
         // Fast path: serve from cache if fresh (< 1 second old).
         {
-            let cache = state.cached.status.lock().unwrap();
+            let cache = state.cached.status.lock();
             if !cache.body.is_empty()
                 && Instant::now()
                     .saturating_duration_since(cache.refreshed_at)
@@ -291,7 +292,7 @@ impl Server {
         };
 
         {
-            let mut cache = state.cached.status.lock().unwrap();
+            let mut cache = state.cached.status.lock();
             cache.body = body.clone();
             cache.refreshed_at = Instant::now();
         }
@@ -331,7 +332,7 @@ impl Server {
         let storage = state.storage.clone();
 
         let db_pairs = match storage
-            .run_blocking_query(Duration::from_secs(30), "pairs", |s| s.pairs_with_bounds())
+            .run_blocking_query(Duration::from_secs(10), "pairs", |s| s.pairs_with_bounds())
             .await
         {
             Ok(pairs) => pairs,
@@ -382,7 +383,7 @@ impl Server {
 
         let q = query.0;
         match storage
-            .run_blocking_query(Duration::from_secs(30), "trades", move |s| {
+            .run_blocking_query(Duration::from_secs(10), "trades", move |s| {
                 s.query_trades(&q)
             })
             .await
@@ -418,7 +419,7 @@ impl Server {
         let storage = state.storage.clone();
 
         let arrow_bytes = match storage
-            .run_blocking_query(Duration::from_secs(30), "arrow", move |s| {
+            .run_blocking_query(Duration::from_secs(20), "arrow", move |s| {
                 s.query_trades_arrow_ipc(&bounded)
             })
             .await

@@ -351,7 +351,7 @@ impl Storage {
             Field::new("is_sell", DataType::Boolean, false),
         ]));
 
-        let mut buf = Vec::with_capacity(limit.saturating_mul(32));
+        let mut buf = Vec::with_capacity(4096);
         let mut batch_count = 0usize;
         {
             let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
