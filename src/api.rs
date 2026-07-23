@@ -590,6 +590,10 @@ async fn rate_limit_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if peer_addr.ip().is_loopback() {
+        return next.run(req).await;
+    }
+
     if let Some(ref limiter) = state.rate_limiter
         && !limiter.check(peer_addr.ip()).await
     {
@@ -639,6 +643,10 @@ async fn priority_gate_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    if peer_addr.ip().is_loopback() {
+        return next.run(req).await;
+    }
+
     if !state.admission_gate.admit(peer_addr.ip()).await {
         tracing::warn!(
             "Admission gate blocked {} on {} (global budget exhausted)",
