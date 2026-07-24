@@ -16,6 +16,7 @@ use flowsurface_exchange::{
     Ticker, Trade,
     adapter::{Exchange, MarketKind, Venue},
 };
+use hyper_util::rt::TokioTimer;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -469,7 +470,7 @@ impl Server {
     pub async fn serve(
         self: Arc<Self>,
         bind_address: SocketAddr,
-    ) -> (tokio::task::JoinHandle<()>, Handle) {
+    ) -> (tokio::task::JoinHandle<()>, Handle<std::net::SocketAddr>) {
         let tls_config = self.tls_config.clone();
         let limiter = self.connection_limiter.clone();
 
@@ -530,6 +531,7 @@ impl Server {
             let result = if let Some(cfg) = tls_config {
                 tracing::info!("Starting HTTPS API on {bind_address}");
                 let mut server = axum_server::tls_rustls::from_tcp_rustls(std_listener, cfg)
+                    .expect("failed to create TLS server from listener")
                     .handle(handle_for_server.clone())
                     .map(|acceptor| LimiterAcceptor {
                         inner: acceptor,
@@ -539,6 +541,7 @@ impl Server {
                 server
                     .http_builder()
                     .http1()
+                    .timer(TokioTimer::new())
                     .header_read_timeout(Duration::from_secs(10))
                     .max_headers(100)
                     .keep_alive(false);
@@ -546,6 +549,7 @@ impl Server {
                 server
                     .http_builder()
                     .http2()
+                    .timer(TokioTimer::new())
                     .keep_alive_interval(Some(Duration::from_secs(30)))
                     .keep_alive_timeout(Duration::from_secs(5));
 
@@ -553,6 +557,7 @@ impl Server {
             } else {
                 tracing::info!("Starting HTTP API on {bind_address}");
                 let mut server = axum_server::from_tcp(std_listener)
+                    .expect("failed to create HTTP server from listener")
                     .handle(handle_for_server.clone())
                     .map(|acceptor| LimiterAcceptor {
                         inner: acceptor,
@@ -562,6 +567,7 @@ impl Server {
                 server
                     .http_builder()
                     .http1()
+                    .timer(TokioTimer::new())
                     .header_read_timeout(Duration::from_secs(10))
                     .max_headers(100)
                     .keep_alive(false);
@@ -569,6 +575,7 @@ impl Server {
                 server
                     .http_builder()
                     .http2()
+                    .timer(TokioTimer::new())
                     .keep_alive_interval(Some(Duration::from_secs(30)))
                     .keep_alive_timeout(Duration::from_secs(5));
 

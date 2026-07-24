@@ -253,7 +253,7 @@ struct AppHandles {
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
     _server: tokio::task::JoinHandle<()>,
-    server_shutdown_handle: axum_server::Handle,
+    server_shutdown_handle: axum_server::Handle<std::net::SocketAddr>,
 }
 
 impl AppHandles {
