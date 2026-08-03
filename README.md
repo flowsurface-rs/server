@@ -73,6 +73,14 @@ available options with inline documentation.
 | `data_dir`             | `"data"` | Directory for DB, auth token, and TLS certs.  |
 | `max_storage_mb`       | `4096`   | Hard cap on DB+WAL (MB); `0` = unlimited.     |
 | `data_retention_hours` | `168`    | Purge trades older than this; `0` = keep all. |
+| `memory_limit_mb`      | `0`      | DuckDB RAM cap; `0` = DuckDB default (80%).   |
+
+> **Low-memory hosts:** By default DuckDB is allowed to use 80% of your
+> machine's RAM. On a small host, this can leave too little for
+> the rest of the system, and queries can fail with an
+> `Out of Memory Error`. For such cases, you better explicitly set `memory_limit_mb`
+> to a lower value, such as `256` or `384` for 1 GB host, so that
+> DuckDB can spill to disk instead of failing when it's at the cap.
 
 ### `[pairs]`
 

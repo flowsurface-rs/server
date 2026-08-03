@@ -30,6 +30,13 @@ data_dir = "data"
 # even if they're within the time-based retention window.
 # Set to 0 to disable the cap entirely.
 # Default: 4096 MiB (4 GiB).
+#
+# This also sizes DuckDB's spill-to-disk budget: max_temp_directory_size
+# is fixed at 20% of this cap (clamped to [512 MiB, 4 GiB]).  With 0
+# (unlimited), it still uses the 4 GiB reference point (~819 MiB).  When a
+# query needs more memory than memory_limit_mb allows, DuckDB spills
+# intermediate results there instead of failing - for sorting, joins,
+# grouping and windowing (other query shapes may still fail).
 max_storage_mb = 4096
 
 # Data retention period in hours.  Trades older than this are
@@ -38,8 +45,16 @@ max_storage_mb = 4096
 # Default: 168 (7 days).
 data_retention_hours = 168
 
-# Hard cap on DuckDB in-memory usage.
+# Hard cap on DuckDB in-memory usage (covers DuckDB's internal buffer
+# manager; query results and output buffers, e.g. Arrow IPC exports,
+# are allocated in addition to this).
 # 0 = use DuckDB's default (80% of system RAM).
+#
+# On hosts with ~1 GB of RAM the default can consume most of the box
+# (DuckDB sizes the pool from physical RAM, ignoring swap) and queries
+# can fail with "Out of Memory Error: failed to pin block ...".
+# Set this explicitly (e.g. 256-400 MB) on low-memory hosts. DuckDB
+# then spills to disk (see the max_storage_mb note) instead of failing.
 # Default: 0 (DuckDB default).
 # memory_limit_mb = 0
 
