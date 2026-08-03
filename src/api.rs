@@ -91,7 +91,8 @@ impl Serialize for AnnotatedTrade {
     }
 }
 
-/// Query parameters for the GET /trades endpoint.
+/// Query parameters shared by the `GET /trades` (JSON) and
+/// `GET /trades.arrow` endpoints.
 #[derive(Debug, Deserialize)]
 pub struct TradeQuery {
     /// Venue filter, e.g. "binance" (used with `market` to derive exchange).
@@ -104,7 +105,11 @@ pub struct TradeQuery {
     pub from: Option<i64>,
     /// Inclusive upper bound (milliseconds since epoch). Optional.
     pub to: Option<i64>,
-    /// Maximum number of records to return (default 1000, max 10_000).
+    /// Maximum number of records to return.
+    ///
+    /// Endpoint-dependent caps:
+    /// - `/trades` (JSON): default `1000`, max `10_000`.
+    /// - `/trades.arrow`: default `50_000`, max `400_000`.
     pub limit: Option<usize>,
 }
 
@@ -490,8 +495,10 @@ impl Server {
     ///
     /// Middleware execution order (outermost → innermost):
     ///
-    ///   1. **Priority gate** — throttles unknown IPs to a tiny global budget
-    ///      (10 req/s) so scanners consume almost no CPU.
+    ///   1. **Priority gate** — throttles unknown IPs to a tiny budget
+    ///      ([`crate::limiter::ADMISSION_PER_IP_BUDGET`] req/s per IP,
+    ///      [`crate::limiter::ADMISSION_GLOBAL_CAP`] req/s total) so scanners
+    ///      consume almost no CPU.
     ///   2. **Auth** — Bearer token verification for protected routes.
     ///   3. **Per-IP rate limiter** — token-bucket per IP (default 500 req/10s).
     ///      Only reached by authenticated requests — unauthenticated requests are
