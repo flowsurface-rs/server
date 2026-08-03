@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use flowsurface_exchange::adapter::AdapterHandles;
 use flowsurface_exchange::{Ticker, TickerInfo};
 
-use crate::api::Server;
+use crate::api::{Server, query_concurrency_limit};
 use crate::config::{Args, BearerToken, Config};
 use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
@@ -74,6 +74,7 @@ struct App {
     cleanup_scheduler: cleanup::CleanupScheduler,
     tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
     rate_limiter: Option<RateLimiter>,
+    query_concurrency: usize,
 }
 
 impl App {
@@ -183,6 +184,7 @@ impl App {
             tls_config,
             cleanup_scheduler,
             rate_limiter,
+            query_concurrency: query_concurrency_limit(config.storage.memory_limit_mb),
         }
     }
 
@@ -232,6 +234,7 @@ impl App {
             self.tls_config,
             self.rate_limiter,
             admission_gate,
+            self.query_concurrency,
         ));
         let (server_task, server_shutdown_handle) = server.serve(self.bind_address).await;
 

@@ -19,6 +19,7 @@ use flowsurface_exchange::{
 use hyper_util::rt::TokioTimer;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::{
     config::BearerToken,
@@ -33,6 +34,9 @@ static GATE_BUDGET_EXHAUSTED: &str = r#"{"error":"server busy, try again later"}
 
 /// Static body for 429 responses
 static RATE_LIMITED: &str = r#"{"error":"rate limit exceeded, slow down"}"#;
+
+/// Static body for 503 responses when the query concurrency cap is hit.
+static QUERY_BUSY: &str = r#"{"error":"server busy, too many concurrent requests"}"#;
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -152,11 +156,16 @@ pub struct Server {
     pub admission_gate: AdmissionGate,
     /// Connection‑level cap that prevents TCP/TLS connection‑storm.
     pub connection_limiter: ConnectionLimiter,
+    /// Semaphore capping concurrent in-flight DB-backed response queries
+    /// (`/trades`, `/trades.arrow`), guarding against unbounded Rust-heap +
+    /// DuckDB memory usage under concurrent requests.
+    pub query_semaphore: Arc<Semaphore>,
     /// Cached pre-serialised response bodies for `/status` and `/exchanges`.
     pub cached: CachedResponses,
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Storage,
         auth_token: Option<BearerToken>,
@@ -165,6 +174,7 @@ impl Server {
         tls_config: Option<RustlsConfig>,
         rate_limiter: Option<RateLimiter>,
         admission_gate: AdmissionGate,
+        query_concurrency: usize,
     ) -> Self {
         // Pre-serialise the /exchanges response — available tickers are
         // immutable after startup, so we compute this once and avoid
@@ -184,6 +194,7 @@ impl Server {
             rate_limiter,
             admission_gate,
             connection_limiter,
+            query_semaphore: Arc::new(Semaphore::new(query_concurrency)),
             cached: CachedResponses {
                 status: Mutex::new(StatusCache {
                     body: String::new(),
@@ -382,6 +393,18 @@ impl Server {
 
         let storage = state.storage.clone();
 
+        let _permit = match Arc::clone(&state.query_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    QUERY_BUSY,
+                )
+                    .into_response();
+            }
+        };
+
         let q = query.0;
         match storage
             .run_blocking_query(Duration::from_secs(10), "trades", move |s| {
@@ -418,6 +441,20 @@ impl Server {
         bounded.limit = Some(limit);
 
         let storage = state.storage.clone();
+
+        // Bound concurrent in-flight DB-backed queries.
+        // Non-blocking: on saturation we return 503 rather than queue.
+        let _permit = match Arc::clone(&state.query_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    QUERY_BUSY,
+                )
+                    .into_response();
+            }
+        };
 
         let arrow_bytes = match storage
             .run_blocking_query(Duration::from_secs(20), "arrow", move |s| {
@@ -669,4 +706,22 @@ async fn priority_gate_middleware(
             .into_response();
     }
     next.run(req).await
+}
+
+/// Derive the maximum number of concurrent in-flight DB-backed response
+/// queries (`/trades`, `/trades.arrow`), which buffer their full output in
+/// the Rust heap outside DuckDB's `memory_limit`.
+///
+/// Budgets ~64 MiB of DuckDB memory per concurrent query (≈2× the real
+/// ~30 MB working set), clamped to at most 8 because DuckDB isn't designed
+/// for many simultaneous queries.  An unset limit (`0` → DuckDB's default of
+/// 80% of system RAM) falls back to 4.
+///
+/// Examples: `0 → 4`, `400 → 6`, `512 → 8`, `4096 → 8`, `32 → 1`.
+pub fn query_concurrency_limit(memory_limit_mb: u64) -> usize {
+    if memory_limit_mb == 0 {
+        4
+    } else {
+        ((memory_limit_mb / 64) as usize).clamp(1, 8)
+    }
 }
