@@ -73,6 +73,43 @@ pub struct AnnotatedTrade {
     pub trade: Trade,
 }
 
+const DEFAULT_ARROW_LIMIT: usize = 50_000;
+const MAX_ARROW_LIMIT: usize = 400_000;
+const MIN_ARROW_LIMIT: usize = 50_000;
+const ROWS_PER_MEMORY_MB: u64 = 250;
+const MEMORY_MB_PER_QUERY: u64 = 512;
+const DEFAULT_QUERY_CONCURRENCY: usize = 4;
+const MAX_QUERY_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudget {
+    pub max_arrow_rows: usize,
+    pub concurrency: usize,
+}
+
+/// Derive response and concurrency limits from the configured DuckDB budget.
+/// An unset budget keeps the high-memory defaults for compatibility.
+pub fn query_budget(memory_limit_mb: u64) -> QueryBudget {
+    if memory_limit_mb == 0 {
+        return QueryBudget {
+            max_arrow_rows: MAX_ARROW_LIMIT,
+            concurrency: DEFAULT_QUERY_CONCURRENCY,
+        };
+    }
+
+    let max_arrow_rows = memory_limit_mb
+        .saturating_mul(ROWS_PER_MEMORY_MB)
+        .clamp(MIN_ARROW_LIMIT as u64, MAX_ARROW_LIMIT as u64) as usize;
+    let concurrency = memory_limit_mb
+        .saturating_div(MEMORY_MB_PER_QUERY)
+        .clamp(1, MAX_QUERY_CONCURRENCY as u64) as usize;
+
+    QueryBudget {
+        max_arrow_rows,
+        concurrency,
+    }
+}
+
 impl AnnotatedTrade {
     pub fn new(ticker: Ticker, trade: Trade) -> Self {
         AnnotatedTrade { ticker, trade }
@@ -109,7 +146,8 @@ pub struct TradeQuery {
     ///
     /// Endpoint-dependent caps:
     /// - `/trades` (JSON): default `1000`, max `10_000`.
-    /// - `/trades.arrow`: default `50_000`, max `400_000`.
+    /// - `/trades.arrow`: default `50_000`, max depends on the memory budget
+    ///   and is capped at `400_000`.
     pub limit: Option<usize>,
 }
 
@@ -167,6 +205,8 @@ pub struct Server {
     /// *outside* DuckDB's `memory_limit` — so this bounds that Rust-heap
     /// usage under concurrent requests, not DuckDB's buffer manager.
     pub query_semaphore: Arc<Semaphore>,
+    /// Memory-derived limits for database-backed HTTP queries.
+    pub query_budget: QueryBudget,
     /// Cached pre-serialised response bodies for `/status` and `/exchanges`.
     pub cached: CachedResponses,
 }
@@ -181,7 +221,7 @@ impl Server {
         tls_config: Option<RustlsConfig>,
         rate_limiter: Option<RateLimiter>,
         admission_gate: AdmissionGate,
-        query_concurrency: usize,
+        query_budget: QueryBudget,
     ) -> Self {
         // Pre-serialise the /exchanges response — available tickers are
         // immutable after startup, so we compute this once and avoid
@@ -201,7 +241,8 @@ impl Server {
             rate_limiter,
             admission_gate,
             connection_limiter,
-            query_semaphore: Arc::new(Semaphore::new(query_concurrency)),
+            query_semaphore: Arc::new(Semaphore::new(query_budget.concurrency)),
+            query_budget,
             cached: CachedResponses {
                 status: Mutex::new(StatusCache {
                     body: String::new(),
@@ -270,7 +311,9 @@ impl Server {
     }
 
     /// Acquire a permit for a DB-backed query handler, or `None` when the
-    /// concurrency cap is saturated.  Non-blocking: refuse rather than queue.
+    /// concurrency cap is saturated. Non-blocking: refuse rather than queue.
+    /// Callers move the permit into the blocking task so timeouts do not
+    /// release capacity while the query is still running.
     fn try_acquire_query(state: &Arc<Self>) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&state.query_semaphore).try_acquire_owned().ok()
     }
@@ -416,13 +459,14 @@ impl Server {
 
         let storage = state.storage.clone();
 
-        let Some(_permit) = Self::try_acquire_query(&state) else {
+        let Some(permit) = Self::try_acquire_query(&state) else {
             return Self::query_busy();
         };
 
         let q = query.0;
         match storage
             .run_blocking_query(Duration::from_secs(10), "trades", move |s| {
+                let _permit = permit;
                 s.query_trades(&q)
             })
             .await
@@ -451,18 +495,22 @@ impl Server {
             return Server::json_err(StatusCode::BAD_REQUEST, &msg);
         }
 
-        let limit = query.limit.unwrap_or(50_000).min(400_000);
+        let limit = query
+            .limit
+            .unwrap_or(DEFAULT_ARROW_LIMIT)
+            .min(state.query_budget.max_arrow_rows);
         let mut bounded = query.0;
         bounded.limit = Some(limit);
 
         let storage = state.storage.clone();
 
-        let Some(_permit) = Self::try_acquire_query(&state) else {
+        let Some(permit) = Self::try_acquire_query(&state) else {
             return Self::query_busy();
         };
 
         let arrow_bytes = match storage
             .run_blocking_query(Duration::from_secs(20), "arrow", move |s| {
+                let _permit = permit;
                 s.query_trades_arrow_ipc(&bounded)
             })
             .await
@@ -715,16 +763,51 @@ async fn priority_gate_middleware(
     next.run(req).await
 }
 
-/// Derive the max number of concurrent in-flight `/trades` and `/trades.arrow`
-/// queries.  These handlers fully buffer their output in the Rust heap
-/// (outside DuckDB's `memory_limit`), so this caps that heap usage: a
-/// heuristic ~64 MiB of output per query, clamped to at most 8.  An unset
-/// limit (`0` → DuckDB's default of 80% of RAM) falls back to a conservative
-/// 4.  Example: `400 → 6`.
-pub fn query_concurrency_limit(memory_limit_mb: u64) -> usize {
-    if memory_limit_mb == 0 {
-        4
-    } else {
-        ((memory_limit_mb / 64) as usize).clamp(1, 8)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_budget_preserves_unset_defaults() {
+        assert_eq!(
+            query_budget(0),
+            QueryBudget {
+                max_arrow_rows: 400_000,
+                concurrency: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn query_budget_scales_arrow_limit_and_concurrency() {
+        assert_eq!(
+            query_budget(400),
+            QueryBudget {
+                max_arrow_rows: 100_000,
+                concurrency: 1,
+            }
+        );
+        assert_eq!(
+            query_budget(1024),
+            QueryBudget {
+                max_arrow_rows: 256_000,
+                concurrency: 2,
+            }
+        );
+        assert_eq!(
+            query_budget(2048),
+            QueryBudget {
+                max_arrow_rows: 400_000,
+                concurrency: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn query_budget_clamps_small_and_large_limits() {
+        assert_eq!(query_budget(1).max_arrow_rows, MIN_ARROW_LIMIT);
+        assert_eq!(query_budget(u64::MAX).max_arrow_rows, MAX_ARROW_LIMIT);
+        assert_eq!(query_budget(1).concurrency, 1);
+        assert_eq!(query_budget(u64::MAX).concurrency, MAX_QUERY_CONCURRENCY);
     }
 }

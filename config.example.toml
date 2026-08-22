@@ -55,6 +55,8 @@ data_retention_hours = 168
 # can fail with "Out of Memory Error: failed to pin block ...".
 # Set this explicitly (e.g. 256-400 MB) on low-memory hosts. DuckDB
 # then spills to disk (see the max_storage_mb note) instead of failing.
+# This setting also scales the API query budget: 400 MB permits up to
+# 100,000 Arrow rows per export and one concurrent database query.
 # Default: 0 (DuckDB default).
 # memory_limit_mb = 0
 

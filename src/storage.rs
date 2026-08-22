@@ -359,8 +359,8 @@ impl Storage {
                 .context("creating Arrow IPC stream writer")?;
 
             let rows = stmt
-                .query_arrow(&params[..])
-                .context("executing Arrow query")?;
+                .stream_arrow(&params[..])
+                .context("executing streaming Arrow query")?;
 
             for batch in rows {
                 writer.write(&batch).context("writing Arrow record batch")?;

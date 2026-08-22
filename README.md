@@ -80,7 +80,11 @@ available options with inline documentation.
 > the rest of the system, and queries can fail with an
 > `Out of Memory Error`. For such cases, you better explicitly set `memory_limit_mb`
 > to a lower value, such as `256` or `384` for 1 GB host, so that
-> DuckDB can spill to disk instead of failing when it's at the cap.
+> DuckDB can spill to disk instead of failing when it's at the cap. The same
+> setting also derives the maximum Arrow export size and concurrent query
+> limit. For example, `400` allows up to 100,000 Arrow rows and one concurrent
+> database query. An unset value keeps the default 400,000-row and four-query
+> limits.
 
 ### `[pairs]`
 
