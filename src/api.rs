@@ -1,10 +1,12 @@
 use parking_lot::Mutex;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
     Router,
+    body::Body,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
@@ -19,14 +21,14 @@ use flowsurface_exchange::{
 use hyper_util::rt::TokioTimer;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     config::BearerToken,
     limiter::{
         AdmissionGate, ConnectionLimiter, LimiterAcceptor, MAX_CONCURRENT_CONNECTIONS, RateLimiter,
     },
-    storage::{PairInfo, Storage},
+    storage::{PairInfo, QueryCancellation, Storage},
 };
 
 /// Static body for 503 responses from the admission gate.
@@ -73,13 +75,107 @@ pub struct AnnotatedTrade {
     pub trade: Trade,
 }
 
-const DEFAULT_ARROW_LIMIT: usize = 50_000;
-const MAX_ARROW_LIMIT: usize = 400_000;
+pub(crate) const DEFAULT_ARROW_LIMIT: usize = 50_000;
+pub(crate) const MAX_ARROW_LIMIT: usize = 1_000_000;
 const MIN_ARROW_LIMIT: usize = 50_000;
-const ROWS_PER_MEMORY_MB: u64 = 250;
+const ROWS_PER_MEMORY_MB: u64 = 2_500;
 const MEMORY_MB_PER_QUERY: u64 = 512;
 const DEFAULT_QUERY_CONCURRENCY: usize = 4;
 const MAX_QUERY_CONCURRENCY: usize = 4;
+const ARROW_CHUNK_SIZE: usize = 256 * 1024;
+const ARROW_CHANNEL_CAPACITY: usize = 2;
+const ARROW_START_TIMEOUT: Duration = Duration::from_secs(20);
+
+type ArrowBodyItem = Result<Vec<u8>, io::Error>;
+
+struct ArrowChunkWriter {
+    sender: mpsc::Sender<ArrowBodyItem>,
+    buffer: Vec<u8>,
+    sent_bytes: usize,
+}
+
+impl ArrowChunkWriter {
+    fn new(sender: mpsc::Sender<ArrowBodyItem>) -> Self {
+        Self {
+            sender,
+            buffer: Vec::with_capacity(ARROW_CHUNK_SIZE),
+            sent_bytes: 0,
+        }
+    }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(ARROW_CHUNK_SIZE));
+        self.sent_bytes += chunk.len();
+        self.sender
+            .blocking_send(Ok(chunk))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Arrow client disconnected"))
+    }
+}
+
+impl Write for ArrowChunkWriter {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let written = bytes.len();
+        while !bytes.is_empty() {
+            let available = ARROW_CHUNK_SIZE - self.buffer.len();
+            let copied = available.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..copied]);
+            bytes = &bytes[copied..];
+
+            if self.buffer.len() == ARROW_CHUNK_SIZE {
+                self.send_buffer()?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.send_buffer()
+    }
+}
+
+struct ArrowBodyState {
+    first: Option<ArrowBodyItem>,
+    receiver: mpsc::Receiver<ArrowBodyItem>,
+    cancellation: Arc<QueryCancellation>,
+}
+
+impl ArrowBodyState {
+    fn new(receiver: mpsc::Receiver<ArrowBodyItem>, cancellation: Arc<QueryCancellation>) -> Self {
+        Self {
+            first: None,
+            receiver,
+            cancellation,
+        }
+    }
+
+    async fn receive(&mut self) -> Option<ArrowBodyItem> {
+        self.receiver.recv().await
+    }
+
+    fn start_with(&mut self, first: Vec<u8>) {
+        self.first = Some(Ok(first));
+    }
+
+    fn into_stream(self) -> impl futures::Stream<Item = ArrowBodyItem> + Send + 'static {
+        futures::stream::unfold(self, |mut state| async move {
+            let item = match state.first.take() {
+                Some(item) => Some(item),
+                None => state.receiver.recv().await,
+            };
+            item.map(|item| (item, state))
+        })
+    }
+}
+
+impl Drop for ArrowBodyState {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryBudget {
@@ -147,7 +243,7 @@ pub struct TradeQuery {
     /// Endpoint-dependent caps:
     /// - `/trades` (JSON): default `1000`, max `10_000`.
     /// - `/trades.arrow`: default `50_000`, max depends on the memory budget
-    ///   and is capped at `400_000`.
+    ///   and is capped at `1_000_000`.
     pub limit: Option<usize>,
 }
 
@@ -200,10 +296,9 @@ pub struct Server {
     /// Connection‑level cap that prevents TCP/TLS connection‑storm.
     pub connection_limiter: ConnectionLimiter,
     /// Semaphore capping concurrent in-flight DB-backed response queries
-    /// (`/trades`, `/trades.arrow`).  These handlers fully materialise their
-    /// output in the Rust heap (trade rows / Arrow IPC bytes), which lies
-    /// *outside* DuckDB's `memory_limit` — so this bounds that Rust-heap
-    /// usage under concurrent requests, not DuckDB's buffer manager.
+    /// (`/trades`, `/trades.arrow`). JSON output is materialised in the Rust
+    /// heap, while Arrow output uses a bounded stream outside DuckDB's
+    /// `memory_limit`. The permit remains held for the complete query.
     pub query_semaphore: Arc<Semaphore>,
     /// Memory-derived limits for database-backed HTTP queries.
     pub query_budget: QueryBudget,
@@ -326,6 +421,59 @@ impl Server {
             QUERY_BUSY,
         )
             .into_response()
+    }
+
+    fn start_arrow_export(
+        storage: Storage,
+        query: TradeQuery,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> ArrowBodyState {
+        let (sender, receiver) = mpsc::channel(ARROW_CHANNEL_CAPACITY);
+        let cancellation = Arc::new(QueryCancellation::new());
+        let worker_cancellation = Arc::clone(&cancellation);
+        let error_sender = sender.clone();
+
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut output = ArrowChunkWriter::new(sender);
+            let result =
+                storage.write_trades_arrow_ipc(&query, &mut output, worker_cancellation.as_ref());
+            result.map(|stats| (stats, output.sent_bytes))
+        });
+
+        let completion = Arc::clone(&cancellation);
+        tokio::spawn(async move {
+            match worker.await {
+                Ok(Ok((stats, bytes))) => {
+                    tracing::debug!(
+                        "Streamed {bytes} bytes of Arrow IPC data ({} rows in {} batches)",
+                        stats.rows,
+                        stats.batches,
+                    );
+                }
+                Ok(Err(error)) if completion.is_cancelled() => {
+                    tracing::debug!("Arrow export cancelled: {error:#}");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!("Arrow export failed: {error:#}");
+                    let _ = error_sender
+                        .send(Err(io::Error::other("Arrow export failed")))
+                        .await;
+                }
+                Err(error) if completion.is_cancelled() => {
+                    tracing::debug!("Arrow export task cancelled: {error:#}");
+                }
+                Err(error) => {
+                    tracing::error!("Arrow export task panicked: {error:#}");
+                    let _ = error_sender
+                        .send(Err(io::Error::other("Arrow export task failed")))
+                        .await;
+                }
+            }
+            completion.complete();
+        });
+
+        ArrowBodyState::new(receiver, cancellation)
     }
 
     /// GET /status  (public — no auth required)
@@ -508,16 +656,24 @@ impl Server {
             return Self::query_busy();
         };
 
-        let arrow_bytes = match storage
-            .run_blocking_query(Duration::from_secs(20), "arrow", move |s| {
-                let _permit = permit;
-                s.query_trades_arrow_ipc(&bounded)
-            })
-            .await
-        {
-            Ok(bytes) => bytes,
-            Err((status, msg)) => return Server::json_err(status, msg),
-        };
+        let mut body_state = Self::start_arrow_export(storage, bounded, permit);
+        let first_chunk =
+            match tokio::time::timeout(ARROW_START_TIMEOUT, body_state.receive()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => {
+                    tracing::error!("Arrow export failed before response started: {error:#}");
+                    return Server::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                }
+                Ok(None) => {
+                    tracing::error!("Arrow export ended before producing an IPC stream");
+                    return Server::json_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                }
+                Err(_) => {
+                    tracing::warn!("Arrow export did not start within {ARROW_START_TIMEOUT:?}");
+                    return Server::json_err(StatusCode::SERVICE_UNAVAILABLE, "query timed out");
+                }
+            };
+        body_state.start_with(first_chunk);
 
         (
             StatusCode::OK,
@@ -531,7 +687,7 @@ impl Server {
                     "attachment; filename=\"trades.arrow\"",
                 ),
             ],
-            arrow_bytes,
+            Body::from_stream(body_state.into_stream()),
         )
             .into_response()
     }
@@ -766,13 +922,94 @@ async fn priority_gate_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET};
+    use arrow::ipc::reader::StreamReader;
+    use futures::StreamExt;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase {
+        directory: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn with_trades(rows: usize) -> (Self, Arc<Server>) {
+            let id = TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "flowsurface-arrow-stream-test-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+
+            let connection = duckdb::Connection::open(directory.join("trades.duckdb")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE trades (
+                        exchange VARCHAR NOT NULL,
+                        symbol VARCHAR NOT NULL,
+                        ts BIGINT NOT NULL,
+                        price DOUBLE NOT NULL,
+                        qty DOUBLE NOT NULL,
+                        is_sell BOOLEAN NOT NULL
+                    );",
+                )
+                .unwrap();
+            let exchange = exchange_from_venue_market("binance", "spot").unwrap();
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO trades
+                         SELECT ?, 'btcusdt', i::BIGINT, i::DOUBLE, 1.0::DOUBLE, i % 2 = 0
+                         FROM range({rows}) AS r(i)"
+                    ),
+                    duckdb::params![exchange],
+                )
+                .unwrap();
+            drop(connection);
+
+            let storage = Storage::open(&directory, 400, 1, 4096).unwrap();
+            let available_tickers = FxHashMap::default();
+            let server = Arc::new(Server::new(
+                storage,
+                None,
+                Vec::new(),
+                &available_tickers,
+                None,
+                None,
+                AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP),
+                query_budget(400),
+            ));
+
+            (Self { directory }, server)
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn arrow_query(limit: usize) -> TradeQuery {
+        TradeQuery {
+            venue: "binance".to_string(),
+            symbol: "btcusdt".to_string(),
+            market: "spot".to_string(),
+            from: None,
+            to: None,
+            limit: Some(limit),
+        }
+    }
 
     #[test]
     fn query_budget_preserves_unset_defaults() {
         assert_eq!(
             query_budget(0),
             QueryBudget {
-                max_arrow_rows: 400_000,
+                max_arrow_rows: 1_000_000,
                 concurrency: 4,
             }
         );
@@ -780,24 +1017,25 @@ mod tests {
 
     #[test]
     fn query_budget_scales_arrow_limit_and_concurrency() {
+        assert_eq!(query_budget(256).max_arrow_rows, 640_000);
         assert_eq!(
             query_budget(400),
             QueryBudget {
-                max_arrow_rows: 100_000,
+                max_arrow_rows: 1_000_000,
                 concurrency: 1,
             }
         );
         assert_eq!(
             query_budget(1024),
             QueryBudget {
-                max_arrow_rows: 256_000,
+                max_arrow_rows: 1_000_000,
                 concurrency: 2,
             }
         );
         assert_eq!(
             query_budget(2048),
             QueryBudget {
-                max_arrow_rows: 400_000,
+                max_arrow_rows: 1_000_000,
                 concurrency: 4,
             }
         );
@@ -809,5 +1047,54 @@ mod tests {
         assert_eq!(query_budget(u64::MAX).max_arrow_rows, MAX_ARROW_LIMIT);
         assert_eq!(query_budget(1).concurrency, 1);
         assert_eq!(query_budget(u64::MAX).concurrency, MAX_QUERY_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn arrow_endpoint_streams_valid_ipc_without_content_length() {
+        let (database, state) = TestDatabase::with_trades(25_000);
+        let response =
+            Server::trades_arrow(State(Arc::clone(&state)), Query(arrow_query(25_000))).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+
+        let mut bytes = Vec::new();
+        let mut chunk_count = 0usize;
+        let mut body = response.into_body().into_data_stream();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+            chunk_count += 1;
+        }
+
+        let batches = StreamReader::try_new(Cursor::new(bytes), None).unwrap();
+        let rows: usize = batches.map(|batch| batch.unwrap().num_rows()).sum();
+        assert_eq!(rows, 25_000);
+        assert!(chunk_count > 1);
+        assert_eq!(state.query_semaphore.available_permits(), 1);
+
+        drop(state);
+        drop(database);
+    }
+
+    #[tokio::test]
+    async fn dropping_arrow_body_cancels_producer_and_releases_permit() {
+        let (database, state) = TestDatabase::with_trades(100_000);
+        let response =
+            Server::trades_arrow(State(Arc::clone(&state)), Query(arrow_query(100_000))).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.query_semaphore.available_permits(), 0);
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.query_semaphore.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Arrow producer did not stop after response body was dropped");
+
+        drop(state);
+        drop(database);
     }
 }

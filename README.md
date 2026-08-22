@@ -82,9 +82,10 @@ available options with inline documentation.
 > to a lower value, such as `256` or `384` for 1 GB host, so that
 > DuckDB can spill to disk instead of failing when it's at the cap. The same
 > setting also derives the maximum Arrow export size and concurrent query
-> limit. For example, `400` allows up to 100,000 Arrow rows and one concurrent
-> database query. An unset value keeps the default 400,000-row and four-query
-> limits.
+> limit. Arrow responses are streamed with bounded buffering, so `400` allows
+> up to 1,000,000 Arrow rows while retaining only a small number of response
+> chunks in memory, with one concurrent trade query. An unset value keeps the
+> one-million-row and four-query limits.
 
 ### `[pairs]`
 
@@ -374,6 +375,6 @@ This is ideal for high-volume data transfer to clients that support Arrow native
 | `symbol` | string | **Required.** Ticker symbol (e.g. `btcusdt`) |
 | `from`   | int    | Unix ms lower bound (inclusive)              |
 | `to`     | int    | Unix ms upper bound (inclusive)              |
-| `limit`  | int    | Max records (default 50 000, max 400 000)    |
+| `limit`  | int    | Max records (default 50 000, max 1 000 000)  |
 
 > **Sort order:** Same as `/trades`.

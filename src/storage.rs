@@ -1,4 +1,4 @@
-use crate::api::{AnnotatedTrade, TradeQuery};
+use crate::api::{AnnotatedTrade, DEFAULT_ARROW_LIMIT, MAX_ARROW_LIMIT, TradeQuery};
 use crate::config::{RetentionHours, StorageBytes};
 use crate::stream;
 
@@ -16,6 +16,72 @@ use tokio::task::JoinHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+enum QueryCancellationState {
+    Pending,
+    Attached(Arc<duckdb::InterruptHandle>),
+    Cancelled,
+    Completed,
+}
+
+pub(crate) struct QueryCancellation {
+    state: parking_lot::Mutex<QueryCancellationState>,
+}
+
+impl QueryCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(QueryCancellationState::Pending),
+        }
+    }
+
+    fn attach(&self, interrupt: Arc<duckdb::InterruptHandle>) -> bool {
+        let mut state = self.state.lock();
+        match &*state {
+            QueryCancellationState::Cancelled => false,
+            QueryCancellationState::Pending => {
+                *state = QueryCancellationState::Attached(interrupt);
+                true
+            }
+            QueryCancellationState::Attached(_) | QueryCancellationState::Completed => false,
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let interrupt = {
+            let mut state = self.state.lock();
+            match std::mem::replace(&mut *state, QueryCancellationState::Cancelled) {
+                QueryCancellationState::Attached(interrupt) => Some(interrupt),
+                QueryCancellationState::Completed => {
+                    *state = QueryCancellationState::Completed;
+                    None
+                }
+                QueryCancellationState::Pending | QueryCancellationState::Cancelled => None,
+            }
+        };
+
+        if let Some(interrupt) = interrupt {
+            interrupt.interrupt();
+        }
+    }
+
+    pub(crate) fn complete(&self) {
+        let mut state = self.state.lock();
+        if !matches!(&*state, QueryCancellationState::Cancelled) {
+            *state = QueryCancellationState::Completed;
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(&*self.state.lock(), QueryCancellationState::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArrowExportStats {
+    pub rows: usize,
+    pub batches: usize,
+}
 
 /// Tracked pair with the timestamp range stored.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -307,12 +373,18 @@ impl Storage {
         Ok(trades)
     }
 
-    /// Returns the complete Arrow IPC streaming format payload suitable
-    /// for HTTP response with `Content-Type: application/vnd.apache.arrow.stream`.
-    pub fn query_trades_arrow_ipc(&self, q: &TradeQuery) -> Result<Vec<u8>> {
+    pub(crate) fn write_trades_arrow_ipc(
+        &self,
+        q: &TradeQuery,
+        output: &mut impl std::io::Write,
+        cancellation: &QueryCancellation,
+    ) -> Result<ArrowExportStats> {
         let conn = self.connection()?;
+        if !cancellation.attach(conn.interrupt_handle()) {
+            anyhow::bail!("Arrow export cancelled before execution");
+        }
 
-        let limit = q.limit.unwrap_or(50_000).min(400_000);
+        let limit = q.limit.unwrap_or(DEFAULT_ARROW_LIMIT).min(MAX_ARROW_LIMIT);
         let exchange = q.exchange_filter();
         let symbol_lower = q.symbol.to_lowercase();
 
@@ -352,10 +424,10 @@ impl Storage {
             Field::new("is_sell", DataType::Boolean, false),
         ]));
 
-        let mut buf = Vec::with_capacity(4096);
         let mut batch_count = 0usize;
+        let mut row_count = 0usize;
         {
-            let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
+            let mut writer = StreamWriter::try_new(output, schema.as_ref())
                 .context("creating Arrow IPC stream writer")?;
 
             let rows = stmt
@@ -363,6 +435,7 @@ impl Storage {
                 .context("executing streaming Arrow query")?;
 
             for batch in rows {
+                row_count += batch.num_rows();
                 writer.write(&batch).context("writing Arrow record batch")?;
                 batch_count += 1;
             }
@@ -370,12 +443,10 @@ impl Storage {
             writer.finish().context("finishing Arrow IPC stream")?;
         }
 
-        tracing::debug!(
-            "Exported {} bytes of Arrow IPC data ({} batch(es))",
-            buf.len(),
-            batch_count,
-        );
-        Ok(buf)
+        Ok(ArrowExportStats {
+            rows: row_count,
+            batches: batch_count,
+        })
     }
 
     /// Persist ticker metadata for every resolved pair so the API can
