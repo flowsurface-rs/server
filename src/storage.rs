@@ -64,6 +64,8 @@ impl Storage {
         let root = Connection::open(&db_path)
             .with_context(|| format!("opening DuckDB at {}", db_path.display()))?;
 
+        // Concurrent reads, appends and retention deletes make secondary ART
+        // indexes unsafe for the hot trades table.
         root.execute_batch(
             "CREATE TABLE IF NOT EXISTS trades (
                 exchange   VARCHAR NOT NULL,
@@ -74,8 +76,7 @@ impl Storage {
                 is_sell    BOOLEAN NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_trades_ex_sym_t
-                ON trades (exchange, symbol, ts);
+            DROP INDEX IF EXISTS idx_trades_ex_sym_t;
 
             CREATE TABLE IF NOT EXISTS ticker_info (
                 exchange        VARCHAR NOT NULL,
