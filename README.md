@@ -178,8 +178,13 @@ treated as one:
 
 - **In-memory buffering**: trades are held in memory for up to
   `flush_interval_ms` (default 2s) before batch-writing to DuckDB.
-  Under extreme load, if the buffer exceeds `max_buffered_trades`,
-  the oldest entries are shed to prevent OOM crashes.
+  The adapter's parsed-event output and server ingestion channels are
+  bounded. Under extreme load, full server-owned channels and buffers shed
+  new entries to prevent OOM crashes. Those server-side drops are counted in
+  `/diagnostics` and mark the server degraded while the affected boundary
+  remains saturated. The adapter's bounded parsed output may also shed events
+  before they reach the server. Raw-frame buffering is internal to the
+  adapter.
 
 - **Configuration changes require a restart**: editing tracked pairs
   or anything in `config.toml` needs a server restart. In-memory
@@ -198,6 +203,7 @@ auth is configured.
 | Method | Path            | Auth     | Description                                        |
 | ------ | --------------- | -------- | -------------------------------------------------- |
 | GET    | `/status`       | ✗ public | Server uptime, DB connectivity check               |
+| GET    | `/diagnostics`  | required | Feed, pipeline, and access diagnostics             |
 | GET    | `/exchanges`    | required | Available ticker symbols per exchange              |
 | GET    | `/pairs`        | required | Configured pairs with time bounds & tracked count  |
 | GET    | `/trades`       | required | Trade data (filtered by venue, symbol, time range) |
@@ -226,6 +232,71 @@ curl http://127.0.0.1:8080/status
     "status": "ok",
     "uptime_secs": 7,
     "db_ok": true
+}
+```
+
+### GET /diagnostics
+
+Returns a point-in-time view of feed and ingestion-pipeline state. This
+endpoint always returns HTTP `200`; inspect the JSON `status` field when
+deciding whether the server is healthy. The endpoint is authenticated when
+the server has an auth token configured.
+
+The feed entries include connection transitions, the last data timestamp,
+connection errors, reconnect counters, and whole-stream restart counters.
+Pipeline fields show current persistence state, retry and irreversible-loss
+counters, the last flush information, and whether any bounded channel or
+buffer is currently saturated or has dropped trades. Access counters are
+cumulative since startup. `last_flush_error` describes the current flush
+state and is cleared after the failed batch is successfully retried. A
+permanently dropped flush batch keeps persistence and overall diagnostics
+degraded for the lifetime of the process.
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  http://127.0.0.1:8080/diagnostics
+```
+
+```json
+{
+    "status": "healthy",
+    "uptime_secs": 123,
+    "database": {"ok": true},
+    "feeds": [
+        {
+            "exchange": "Binance Linear",
+            "state": "connected",
+            "connected_at": 1760000000000,
+            "last_data_at": 1760000005000,
+            "last_error": null,
+            "disconnect_count": 0,
+            "failed_connect_attempts": 0,
+            "reconnect_count": 0,
+            "stream_restart_count": 0,
+            "last_persist_at": 1760000006000
+        }
+    ],
+    "pipeline": {
+        "persistence_healthy": true,
+        "last_flush_at": 1760000006000,
+        "last_flush_error": null,
+        "flush_failure_count": 0,
+        "flush_retry_pending_trades": 0,
+        "flush_dropped_trades": 0,
+        "event_channel_saturated": false,
+        "event_channel_dropped_trades": 0,
+        "persist_channel_saturated": false,
+        "persist_channel_dropped_trades": 0,
+        "data_buffer_saturated": false,
+        "data_buffer_dropped_trades": 0
+    },
+    "access": {
+        "auth_failures": 0,
+        "admission_blocked": 0,
+        "rate_limited": 0,
+        "connection_rejected": 0,
+        "accept_timeouts": 0
+    }
 }
 ```
 

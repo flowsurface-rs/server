@@ -1,5 +1,6 @@
 use crate::api::{AnnotatedTrade, DEFAULT_ARROW_LIMIT, MAX_ARROW_LIMIT, TradeQuery};
 use crate::config::{RetentionHours, StorageBytes};
+use crate::diagnostics::Diagnostics;
 use crate::stream;
 
 use flowsurface_exchange::adapter::{Event, Exchange};
@@ -98,7 +99,7 @@ pub struct PairInfo {
 ///
 /// Internally holds a single root `duckdb_database` handle.  All
 /// sub-connections (readers, writer) are created via `try_clone()`,
-/// ensuring they share the same buffer pool, catalog cache and WAL —
+/// ensuring they share the same buffer pool, catalog cache and WAL,
 /// so writes are immediately visible to subsequent reads.
 #[derive(Clone)]
 pub struct Storage {
@@ -243,12 +244,12 @@ impl Storage {
 
     /// Rewrite the database file to reclaim filesystem space freed by
     /// prior `DELETE` operations.  `CHECKPOINT` alone only merges the
-    /// WAL — it does not shrink the main file.  `VACUUM` is O(n) in
+    /// WAL. It does not shrink the main file. `VACUUM` is O(n) in
     /// remaining rows, so callers should gate it behind a threshold.
     ///
     /// `VACUUM` requires exclusive table access, so it can fail with a
     /// transaction conflict if the batch flusher is mid-append.  This
-    /// method retries a few times with short sleeps — the flusher's
+    /// method retries a few times with short sleeps. The flusher's
     /// appender is only held open for a few milliseconds per flush, so
     /// a brief wait is almost always enough.
     pub fn vacuum(&self) -> Result<()> {
@@ -522,15 +523,11 @@ impl Storage {
         Ok(pairs)
     }
 
-    /// Count of tracked pairs in the database.
-    pub fn pair_count(&self) -> Result<u64> {
+    /// Perform a cheap database liveness probe.
+    pub fn health_check(&self) -> Result<()> {
         let conn = self.connection()?;
-        let count: u64 = conn.query_row(
-            "SELECT COUNT(DISTINCT exchange || ':' || symbol) FROM trades",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+        conn.query_row("SELECT 1", [], |row| row.get::<_, i32>(0))?;
+        Ok(())
     }
 
     /// Set a metadata key-value pair.
@@ -636,6 +633,7 @@ impl Storage {
         rx: &mut stream::StreamReceivers,
         flush_interval: Duration,
         max_buffered_trades: usize,
+        diagnostics: Arc<Diagnostics>,
     ) -> JoinHandle<()> {
         let mut rx = rx
             .persist
@@ -644,27 +642,31 @@ impl Storage {
         let store = self.clone();
 
         tokio::spawn(async move {
-            let mut flusher = BatchFlusher::new(max_buffered_trades);
-            let mut flush_handle: Option<JoinHandle<anyhow::Result<()>>> = None;
+            let flush_interval = flush_interval.max(Duration::from_millis(1));
+            let mut flusher = BatchFlusher::new(max_buffered_trades, Arc::clone(&diagnostics));
+            let mut flush_handle: Option<JoinHandle<FlushTaskResult>> = None;
+            let mut in_flight_trades = 0;
+            let mut in_flight_is_retry = false;
+            let mut retry_batch: Option<Vec<PersistableData>> = None;
             let mut interval = tokio::time::interval(flush_interval);
             interval.reset_immediately();
 
             loop {
                 if flush_handle.as_ref().is_some_and(|h| h.is_finished()) {
                     match flush_handle.take() {
-                        Some(handle) => match handle.await {
-                            Ok(Ok(())) => flusher.flush_succeeded(),
-                            Ok(Err(e)) => {
-                                tracing::error!(
-                                    "Batch flush failed ({} trades in new buffer, \
-                                         failed batch dropped): {e:#}",
-                                    flusher.pending_count()
-                                );
-                            }
-                            Err(_) => {
-                                tracing::error!("Batch flush task panicked or cancelled");
-                            }
-                        },
+                        Some(handle) => {
+                            complete_flush(
+                                handle,
+                                in_flight_trades,
+                                in_flight_is_retry,
+                                &mut flusher,
+                                &mut retry_batch,
+                                &diagnostics,
+                            )
+                            .await;
+                            in_flight_trades = 0;
+                            in_flight_is_retry = false;
+                        }
                         None => {
                             tracing::warn!(
                                 "Flush handle was unexpectedly None after is_finished check"
@@ -682,15 +684,17 @@ impl Storage {
                             flusher.ingest(event);
                         }
 
-                        // Start a blocking flush if we have data and none
-                        // is currently in-flight.
-                        if flusher.has_pending() && flush_handle.is_none() {
-                            let batch = flusher.take_all();
-                            let store = store.clone();
-                            flush_handle = Some(tokio::task::spawn_blocking(move || {
-                                let mut writer = store.open_writer()?;
-                                writer.flush_all(&batch)
-                            }));
+                        if flush_handle.is_none() {
+                            let (batch, is_retry) = match retry_batch.take() {
+                                Some(batch) => (Some(batch), true),
+                                None if flusher.has_pending() => (Some(flusher.take_all()), false),
+                                None => (None, false),
+                            };
+                            if let Some(batch) = batch {
+                                in_flight_trades = batch.len();
+                                in_flight_is_retry = is_retry;
+                                flush_handle = Some(spawn_flush(store.clone(), batch));
+                            }
                         }
                     }
                     maybe = rx.recv() => {
@@ -699,23 +703,35 @@ impl Storage {
                                 flusher.ingest(event);
                             }
                             None => {
-                                // Channel closed: wait for in-flight flush,
-                                // then flush whatever remains in the buffer.
-                                if let Some(handle) = flush_handle.take() && let Err(e) = handle.await {
-                                    tracing::error!("Final flush task failed: {e:#}");
+                                // Channel closed: finish the in-flight batch,
+                                // retry a failed batch, then flush new data.
+                                if let Some(handle) = flush_handle.take() {
+                                    complete_flush(
+                                        handle,
+                                        in_flight_trades,
+                                        in_flight_is_retry,
+                                        &mut flusher,
+                                        &mut retry_batch,
+                                        &diagnostics,
+                                    )
+                                    .await;
                                 }
-                                if flusher.has_pending() {
-                                    let batch = flusher.take_all();
-                                    let store = store.clone();
-                                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                                        let mut writer = store.open_writer()?;
-                                        writer.flush_all(&batch)
-                                    })
-                                    .await
-                                    {
-                                        tracing::error!("Final flush failed: {e:#}");
-                                    }
-                                }
+                                flush_final_batch(
+                                    retry_batch.take(),
+                                    true,
+                                    &store,
+                                    &mut flusher,
+                                    &diagnostics,
+                                )
+                                .await;
+                                flush_final_batch(
+                                    flusher.has_pending().then(|| flusher.take_all()),
+                                    false,
+                                    &store,
+                                    &mut flusher,
+                                    &diagnostics,
+                                )
+                                .await;
                                 tracing::info!("Batch flusher channel closed.");
                                 break;
                             }
@@ -724,6 +740,136 @@ impl Storage {
                 }
             }
         })
+    }
+}
+
+struct FlushFailure {
+    batch: Vec<PersistableData>,
+    error: anyhow::Error,
+}
+
+type FlushTaskResult = std::result::Result<BatchStats, FlushFailure>;
+
+fn spawn_flush(store: Storage, batch: Vec<PersistableData>) -> JoinHandle<FlushTaskResult> {
+    let stats = BatchStats::from_items(&batch);
+    tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let mut writer = store.open_writer()?;
+            writer.flush_all(&batch)?;
+            Ok::<_, anyhow::Error>(stats)
+        })();
+
+        match result {
+            Ok(stats) => Ok(stats),
+            Err(error) => Err(FlushFailure { batch, error }),
+        }
+    })
+}
+
+async fn complete_flush(
+    handle: JoinHandle<FlushTaskResult>,
+    in_flight_trades: usize,
+    in_flight_is_retry: bool,
+    flusher: &mut BatchFlusher,
+    retry_batch: &mut Option<Vec<PersistableData>>,
+    diagnostics: &Diagnostics,
+) {
+    match handle.await {
+        Ok(Ok(stats)) => {
+            if in_flight_is_retry {
+                diagnostics.record_flush_retry_succeeded(&stats.persisted);
+            } else {
+                diagnostics.record_flush_succeeded(&stats.persisted);
+            }
+            flusher.flush_succeeded();
+        }
+        Ok(Err(failure)) => {
+            let pending = failure.batch.len();
+            diagnostics.record_flush_failed(&format!("{:#}", failure.error), pending);
+            tracing::error!(
+                "Batch flush failed ({pending} trades retained for retry): {:#}",
+                failure.error
+            );
+            *retry_batch = Some(failure.batch);
+        }
+        Err(error) => {
+            let reason = if error.is_panic() {
+                "batch flush task panicked"
+            } else {
+                "batch flush task was cancelled"
+            };
+            diagnostics.record_flush_failed(reason, 0);
+            diagnostics.record_flush_dropped(in_flight_trades);
+            tracing::error!(
+                dropped_trades = in_flight_trades,
+                "{reason}"
+            );
+        }
+    }
+}
+
+async fn flush_final_batch(
+    batch: Option<Vec<PersistableData>>,
+    is_retry: bool,
+    store: &Storage,
+    flusher: &mut BatchFlusher,
+    diagnostics: &Diagnostics,
+) {
+    let Some(batch) = batch else {
+        return;
+    };
+    let trade_count = batch.len();
+    let result = spawn_flush(store.clone(), batch).await;
+    match result {
+        Ok(Ok(stats)) => {
+            if is_retry {
+                diagnostics.record_flush_retry_succeeded(&stats.persisted);
+            } else {
+                diagnostics.record_flush_succeeded(&stats.persisted);
+            }
+            flusher.flush_succeeded();
+        }
+        Ok(Err(failure)) => {
+            diagnostics.record_flush_failed(&format!("{:#}", failure.error), trade_count);
+            diagnostics.record_flush_dropped(failure.batch.len());
+            tracing::error!(
+                dropped_trades = failure.batch.len(),
+                "Final batch flush failed: {:#}",
+                failure.error
+            );
+        }
+        Err(error) => {
+            let reason = if error.is_panic() {
+                "final batch flush task panicked"
+            } else {
+                "final batch flush task was cancelled"
+            };
+            diagnostics.record_flush_failed(reason, trade_count);
+            diagnostics.record_flush_dropped(trade_count);
+            tracing::error!(
+                dropped_trades = trade_count,
+                "{reason}"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BatchStats {
+    persisted: Vec<Exchange>,
+}
+
+impl BatchStats {
+    fn from_items(items: &[PersistableData]) -> Self {
+        let mut stats = Self::default();
+        for item in items {
+            let PersistableData::Trade(trade) = item;
+            let exchange = trade.ticker.exchange;
+            if !stats.persisted.contains(&exchange) {
+                stats.persisted.push(exchange);
+            }
+        }
+        stats
     }
 }
 
@@ -740,12 +886,14 @@ enum PersistableData {
 /// are logged or ignored.
 struct BatchFlusher {
     buf: DataBuffer,
+    diagnostics: Arc<Diagnostics>,
 }
 
 impl BatchFlusher {
-    fn new(max_items: usize) -> Self {
+    fn new(max_items: usize, diagnostics: Arc<Diagnostics>) -> Self {
         Self {
             buf: DataBuffer::new(max_items),
+            diagnostics,
         }
     }
 
@@ -755,17 +903,25 @@ impl BatchFlusher {
             Event::TradesReceived(stream_kind, _tss, trades) => {
                 let ticker_info = stream_kind.ticker_info();
                 for ft_trade in trades.iter() {
-                    self.buf.push(PersistableData::Trade(AnnotatedTrade::new(
+                    if !self.buf.push(PersistableData::Trade(AnnotatedTrade::new(
                         ticker_info.ticker,
                         *ft_trade,
-                    )));
+                    ))) {
+                        self.diagnostics.record_buffer_trade_drop();
+                    }
                 }
             }
             Event::DepthReceived(stream_kind, _update_t, _depth) => {
-                tracing::trace!(?stream_kind, "Depth update received");
+                tracing::trace!(
+                    ?stream_kind,
+                    "Depth update received"
+                );
             }
             Event::KlineReceived(stream_kind, _kline) => {
-                tracing::trace!(?stream_kind, "Kline update received");
+                tracing::trace!(
+                    ?stream_kind,
+                    "Kline update received"
+                );
             }
             Event::Connected(_) | Event::Disconnected(..) => {
                 // Already logged upstream in EventOutlets::route.
@@ -777,15 +933,15 @@ impl BatchFlusher {
         !self.buf.is_empty()
     }
 
-    fn pending_count(&self) -> usize {
-        self.buf.len()
-    }
-
     fn take_all(&mut self) -> Vec<PersistableData> {
         self.buf.take()
     }
 
     fn flush_succeeded(&mut self) {
+        if self.has_pending() {
+            return;
+        }
+        self.diagnostics.record_buffer_recovered();
         self.buf.flush_succeeded();
     }
 }
@@ -807,16 +963,20 @@ impl DataBuffer {
         }
     }
 
-    fn push(&mut self, item: PersistableData) {
+    fn push(&mut self, item: PersistableData) -> bool {
         if self.items.len() < self.max {
             self.items.push(item);
+            true
         } else if !self.warned {
             tracing::warn!(
-                "Data buffer exceeded {} — dropping items to protect against OOM. \
+                "Data buffer exceeded {}, dropping items to protect against OOM. \
                  This warning is rate-limited.",
                 self.max
             );
             self.warned = true;
+            false
+        } else {
+            false
         }
     }
 
@@ -828,10 +988,6 @@ impl DataBuffer {
             );
             self.warned = false;
         }
-    }
-
-    fn len(&self) -> usize {
-        self.items.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -857,35 +1013,42 @@ impl BatchWriter {
             return Ok(());
         }
 
-        let mut trade_appender = self
+        let transaction = self
             .conn
-            .appender("trades")
-            .context("creating DuckDB appender for trades")?;
+            .transaction()
+            .context("starting DuckDB batch transaction")?;
+        {
+            let mut trade_appender = transaction
+                .appender("trades")
+                .context("creating DuckDB appender for trades")?;
 
-        for item in items {
-            match item {
-                PersistableData::Trade(t) => {
-                    trade_appender
-                        .append_row((
-                            &t.ticker.exchange.to_string(),
-                            &t.ticker
-                                .display_symbol()
-                                .map(|s| s.to_lowercase())
-                                .unwrap_or_else(|| t.ticker.to_string().to_lowercase()),
-                            t.trade.time.as_u64() as i64,
-                            t.trade.price.to_f64(),
-                            t.trade.qty.to_f64(),
-                            t.trade.is_sell,
-                        ))
-                        .context("appending trade row via DuckDB appender")?;
+            for item in items {
+                match item {
+                    PersistableData::Trade(t) => {
+                        trade_appender
+                            .append_row((
+                                &t.ticker.exchange.to_string(),
+                                &t.ticker
+                                    .display_symbol()
+                                    .map(|s| s.to_lowercase())
+                                    .unwrap_or_else(|| t.ticker.to_string().to_lowercase()),
+                                t.trade.time.as_u64() as i64,
+                                t.trade.price.to_f64(),
+                                t.trade.qty.to_f64(),
+                                t.trade.is_sell,
+                            ))
+                            .context("appending trade row via DuckDB appender")?;
+                    }
                 }
             }
+
+            trade_appender
+                .flush()
+                .context("flushing DuckDB trade appender")?;
         }
 
-        trade_appender
-            .flush()
-            .context("flushing DuckDB trade appender")?;
-
-        Ok(())
+        transaction
+            .commit()
+            .context("committing DuckDB batch transaction")
     }
 }

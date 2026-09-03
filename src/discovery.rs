@@ -1,4 +1,8 @@
+use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 
 use flowsurface_exchange::adapter::{AdapterHandles, Exchange, MarketKind, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
@@ -6,6 +10,10 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 use crate::config::WhitelistTemplates;
 
 pub type MetadataCache = FxHashMap<Exchange, FxHashMap<Ticker, Option<TickerInfo>>>;
+
+const EXCHANGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXCHANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Orchestrate the full pair discovery pipeline: determine which venues to
 /// use based on discovery mode, spawn adapter handles, fetch ticker metadata
@@ -16,7 +24,7 @@ pub async fn setup_pairs(
     base_assets: &[String],
     discovery_mode: bool,
     whitelist: &WhitelistTemplates,
-) -> (AdapterHandles, MetadataCache, Vec<TickerInfo>) {
+) -> Result<(AdapterHandles, MetadataCache, Vec<TickerInfo>)> {
     let venues: Vec<Venue> = if discovery_mode {
         Venue::ALL.to_vec()
     } else {
@@ -26,7 +34,11 @@ pub async fn setup_pairs(
             .collect()
     };
     tracing::info!("Spawning venue adapters: {venues:?}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(EXCHANGE_CONNECT_TIMEOUT)
+        .timeout(EXCHANGE_REQUEST_TIMEOUT)
+        .build()
+        .context("building exchange HTTP client")?;
     let adapter_handles = AdapterHandles::spawn_venues(&client, venues, None);
 
     tracing::info!("Fetching ticker metadata from exchanges…");
@@ -34,7 +46,36 @@ pub async fn setup_pairs(
 
     let resolved_pairs = resolve_pairs(base_assets, whitelist, &metadata_cache);
 
-    (adapter_handles, metadata_cache, resolved_pairs)
+    Ok((adapter_handles, metadata_cache, resolved_pairs))
+}
+
+async fn fetch_ticker_metadata(
+    handles: &AdapterHandles,
+    venue: Venue,
+    markets: &[MarketKind],
+) -> Result<HashMap<Ticker, Option<TickerInfo>>> {
+    with_timeout(
+        handles.fetch_ticker_metadata(venue, markets),
+        METADATA_FETCH_TIMEOUT,
+        format!("metadata request for {venue} timed out"),
+    )
+    .await
+    .with_context(|| format!("fetching metadata for {venue}"))
+}
+
+async fn with_timeout<T, E, F>(
+    operation: F,
+    timeout: Duration,
+    timeout_context: String,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    tokio::time::timeout(timeout, operation)
+        .await
+        .with_context(|| timeout_context)?
+        .context("metadata operation failed")
 }
 
 /// Fetch metadata for exchanges and return a cache.
@@ -54,7 +95,7 @@ async fn build_metadata_cache(
             let venue = exchange.venue();
             let market = exchange.market_type();
 
-            match handles.fetch_ticker_metadata(venue, &[market]).await {
+            match fetch_ticker_metadata(handles, venue, &[market]).await {
                 Ok(meta) => {
                     tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
                     cache.insert(exchange, meta.into_iter().collect());
@@ -81,7 +122,7 @@ async fn build_metadata_cache(
                     continue;
                 };
 
-                match handles.fetch_ticker_metadata(venue, &[market]).await {
+                match fetch_ticker_metadata(handles, venue, &[market]).await {
                     Ok(meta) => {
                         tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
                         cache.insert(exchange, meta.into_iter().collect());

@@ -339,16 +339,16 @@ impl Config {
     ///   exits with code 1 — it never overwrites a broken user file.
     pub fn load_or_write_template(path: &Path) -> Self {
         if !path.exists() {
-            tracing::info!(
+            eprintln!(
                 "Config file not found at {}. Writing default template.",
                 path.display()
             );
 
             if let Err(write_err) = std::fs::write(path, Self::template()) {
-                tracing::error!("Failed to write default config: {write_err:#}");
+                eprintln!("Failed to write default config: {write_err:#}");
                 std::process::exit(1);
             }
-            tracing::info!(
+            eprintln!(
                 "Template written to {}. Edit it to suit your needs, then re-run.",
                 path.display()
             );
@@ -358,7 +358,7 @@ impl Config {
         match Self::load(path) {
             Ok(cfg) => cfg,
             Err(e) => {
-                tracing::error!(
+                eprintln!(
                     "Failed to parse config at {}:\n  {e:#}\n\
                      Fix or remove the file and re-run.",
                     path.display()

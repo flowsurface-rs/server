@@ -25,6 +25,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     config::BearerToken,
+    diagnostics::{Diagnostics, DiagnosticsSnapshot},
     limiter::{
         AdmissionGate, ConnectionLimiter, LimiterAcceptor, MAX_CONCURRENT_CONNECTIONS, RateLimiter,
     },
@@ -55,17 +56,101 @@ enum Response {
 /// Pre-serialised response bodies for endpoints whose output is either
 /// immutable or infrequently changing.
 pub struct CachedResponses {
-    /// `/status` — cached JSON body with a ~1 second TTL.  Wrapped in a
-    /// `Mutex` because the cache is refreshed on expiry.
-    status: Mutex<StatusCache>,
     /// `/exchanges` — computed once at startup, never changes.
     exchanges: String,
 }
 
-/// Inner state for the cached `/status` response.
-struct StatusCache {
-    body: String,
-    refreshed_at: Instant,
+const DATABASE_HEALTH_CACHE_TTL: Duration = Duration::from_secs(1);
+const DATABASE_HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct DatabaseHealth {
+    last_result: Mutex<Option<DatabaseHealthResult>>,
+    probe_semaphore: Arc<Semaphore>,
+    cache_ttl: Duration,
+    probe_timeout: Duration,
+}
+
+struct DatabaseHealthResult {
+    checked_at: Instant,
+    ok: bool,
+}
+
+impl DatabaseHealth {
+    fn new() -> Self {
+        Self::with_limits(DATABASE_HEALTH_CACHE_TTL, DATABASE_HEALTH_TIMEOUT)
+    }
+
+    fn with_limits(cache_ttl: Duration, probe_timeout: Duration) -> Self {
+        Self {
+            last_result: Mutex::new(None),
+            probe_semaphore: Arc::new(Semaphore::new(1)),
+            cache_ttl,
+            probe_timeout,
+        }
+    }
+
+    async fn check<F>(&self, probe: F) -> bool
+    where
+        F: FnOnce() -> bool + Send + 'static,
+    {
+        let deadline = Instant::now() + self.probe_timeout;
+        if let Some(result) = self.fresh_result() {
+            return result;
+        }
+
+        let permit = match tokio::time::timeout(
+            remaining_time(deadline),
+            Arc::clone(&self.probe_semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            _ => return self.fresh_result().unwrap_or(false),
+        };
+
+        if let Some(result) = self.fresh_result() {
+            drop(permit);
+            return result;
+        }
+
+        let task = tokio::task::spawn_blocking(move || {
+            let result = probe();
+            // Keep the permit in the blocking task until the result is ready.
+            (permit, result)
+        });
+        let result = match tokio::time::timeout(remaining_time(deadline), task).await {
+            Ok(Ok((permit, result))) => {
+                self.last_result.lock().replace(DatabaseHealthResult {
+                    checked_at: Instant::now(),
+                    ok: result,
+                });
+                drop(permit);
+                return result;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("Database health check task failed: {error:#}");
+                false
+            }
+            Err(_) => false,
+        };
+
+        self.last_result.lock().replace(DatabaseHealthResult {
+            checked_at: Instant::now(),
+            ok: result,
+        });
+        result
+    }
+
+    fn fresh_result(&self) -> Option<bool> {
+        let result = self.last_result.lock();
+        result
+            .as_ref()
+            .and_then(|result| (result.checked_at.elapsed() < self.cache_ttl).then_some(result.ok))
+    }
+}
+
+fn remaining_time(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 /// A normalized trade record, used both in-memory and serialized to JSON.
@@ -281,8 +366,8 @@ pub fn exchange_from_venue_market(venue: &str, market: &str) -> Option<String> {
 
 pub struct Server {
     pub storage: Storage,
-    pub startup: Instant,
     pub auth_token: Option<BearerToken>,
+    pub diagnostics: Arc<Diagnostics>,
     /// The tickers configured at startup.
     /// Used by `/pairs` to include pairs that have not yet received trades.
     pub configured_pairs: Vec<Ticker>,
@@ -302,8 +387,9 @@ pub struct Server {
     pub query_semaphore: Arc<Semaphore>,
     /// Memory-derived limits for database-backed HTTP queries.
     pub query_budget: QueryBudget,
-    /// Cached pre-serialised response bodies for `/status` and `/exchanges`.
+    /// Cached pre-serialised response body for `/exchanges`.
     pub cached: CachedResponses,
+    database_health: DatabaseHealth,
 }
 
 impl Server {
@@ -313,6 +399,7 @@ impl Server {
         auth_token: Option<BearerToken>,
         configured_pairs: Vec<Ticker>,
         available_tickers: &FxHashMap<String, Vec<String>>,
+        diagnostics: Arc<Diagnostics>,
         tls_config: Option<RustlsConfig>,
         rate_limiter: Option<RateLimiter>,
         admission_gate: AdmissionGate,
@@ -329,8 +416,8 @@ impl Server {
 
         Self {
             storage,
-            startup: Instant::now(),
             auth_token,
+            diagnostics,
             configured_pairs,
             tls_config,
             rate_limiter,
@@ -339,12 +426,9 @@ impl Server {
             query_semaphore: Arc::new(Semaphore::new(query_budget.concurrency)),
             query_budget,
             cached: CachedResponses {
-                status: Mutex::new(StatusCache {
-                    body: String::new(),
-                    refreshed_at: Instant::now(),
-                }),
                 exchanges: cached_exchanges_json,
             },
+            database_health: DatabaseHealth::new(),
         }
     }
 
@@ -423,6 +507,19 @@ impl Server {
             .into_response()
     }
 
+    async fn database_is_healthy(&self) -> bool {
+        let storage = self.storage.clone();
+        self.database_health
+            .check(move || match storage.health_check() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("Database health check failed: {error:#}");
+                    false
+                }
+            })
+            .await
+    }
+
     fn start_arrow_export(
         storage: Storage,
         query: TradeQuery,
@@ -480,31 +577,9 @@ impl Server {
     ///
     /// Returns server uptime and a basic DB connectivity check.
     /// Suitable for load-balancer / container health probes.
-    ///
-    /// The response is cached for ~1 second to avoid a DB query (and full
-    /// serialization) on every health-check request.
     async fn status(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        // Fast path: serve from cache if fresh (< 1 second old).
-        {
-            let cache = state.cached.status.lock();
-            if !cache.body.is_empty()
-                && Instant::now()
-                    .saturating_duration_since(cache.refreshed_at)
-                    .as_secs()
-                    < 1
-            {
-                return (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    cache.body.clone(),
-                )
-                    .into_response();
-            }
-        }
-
-        // Slow path: query the DB, build response, update cache.
-        let uptime = state.startup.elapsed().as_secs();
-        let db_ok = state.storage.pair_count().is_ok();
+        let uptime = state.diagnostics.uptime().as_secs();
+        let db_ok = state.database_is_healthy().await;
         let body = match serde_json::to_string(&serde_json::json!({
             "status": "ok",
             "uptime_secs": uptime,
@@ -517,18 +592,23 @@ impl Server {
             }
         };
 
-        {
-            let mut cache = state.cached.status.lock();
-            cache.body = body.clone();
-            cache.refreshed_at = Instant::now();
-        }
-
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
             body,
         )
             .into_response()
+    }
+
+    /// GET /diagnostics (authenticated)
+    ///
+    /// Returns the current feed and ingestion pipeline state. The endpoint
+    /// remains available while the server is degraded so its response can
+    /// explain the failure.
+    async fn diagnostics(State(state): State<Arc<Self>>) -> impl IntoResponse {
+        let database_ok = state.database_is_healthy().await;
+        let snapshot: DiagnosticsSnapshot = state.diagnostics.snapshot(database_ok);
+        Self::json_ok(&snapshot)
     }
 
     /// GET /exchanges
@@ -708,8 +788,8 @@ impl Server {
     ///      Only reached by authenticated requests — unauthenticated requests are
     ///      rejected by auth first, so they never consume rate-limiter bookkeeping.
     ///
-    /// `/status` is public (no auth) but still goes through the priority gate
-    /// and its response is cached to avoid a DB hit on every health check.
+    /// `/status` is public (no auth) but still goes through the priority gate.
+    /// Its database probe is cached and bounded so health checks stay cheap.
     ///
     /// **Connection‑level DoS protection:** both the TLS and plain‑HTTP paths
     /// use `axum_server` with a [`LimiterAcceptor`] that caps concurrent
@@ -738,6 +818,7 @@ impl Server {
         let protected = Router::new()
             .route("/exchanges", get(Server::exchanges))
             .route("/pairs", get(Server::pairs))
+            .route("/diagnostics", get(Server::diagnostics))
             .route("/trades", get(Server::trades))
             .route("/trades.arrow", get(Server::trades_arrow))
             .layer(axum::middleware::from_fn_with_state(
@@ -977,6 +1058,7 @@ mod tests {
                 None,
                 Vec::new(),
                 &available_tickers,
+                Arc::new(Diagnostics::new()),
                 None,
                 None,
                 AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP),

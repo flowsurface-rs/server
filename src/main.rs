@@ -1,6 +1,7 @@
 mod api;
 mod cleanup;
 mod config;
+mod diagnostics;
 mod discovery;
 mod limiter;
 mod storage;
@@ -21,6 +22,7 @@ use flowsurface_exchange::{Ticker, TickerInfo};
 
 use crate::api::{QueryBudget, Server, query_budget};
 use crate::config::{Args, BearerToken, Config};
+use crate::diagnostics::Diagnostics;
 use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
 
@@ -66,6 +68,7 @@ struct App {
     storage: Storage,
     adapter_handles: AdapterHandles,
     resolved_pairs: Vec<TickerInfo>,
+    diagnostics: Arc<Diagnostics>,
     metadata_cache: discovery::MetadataCache,
     bind_address: SocketAddr,
     auth_token: Option<BearerToken>,
@@ -119,7 +122,11 @@ impl App {
             config.pairs.discovery_mode,
             &whitelist,
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to initialise exchange discovery: {e:#}");
+            std::process::exit(1);
+        });
 
         if resolved_pairs.is_empty() {
             if config.pairs.discovery_mode {
@@ -146,6 +153,11 @@ impl App {
                 .collect::<rustc_hash::FxHashSet<_>>()
                 .len()
         );
+
+        let diagnostics = Arc::new(Diagnostics::new());
+        for ticker_info in &resolved_pairs {
+            diagnostics.register_exchange(ticker_info.exchange());
+        }
 
         // Persist ticker metadata for the API layer.
         if let Err(e) = storage.store_ticker_infos(&resolved_pairs) {
@@ -176,6 +188,7 @@ impl App {
             storage,
             adapter_handles,
             resolved_pairs,
+            diagnostics,
             metadata_cache,
             bind_address: config.network.bind_address,
             auth_token: config.auth_token.clone(),
@@ -196,6 +209,7 @@ impl App {
             self.adapter_handles,
             &self.resolved_pairs,
             shutdown.child_token(),
+            Arc::clone(&self.diagnostics),
         );
 
         let cleanup_last_run = tokio::task::spawn_blocking({
@@ -213,6 +227,7 @@ impl App {
             &mut rx,
             self.flush_interval,
             self.max_buffered_trades,
+            Arc::clone(&self.diagnostics),
         );
 
         let configured_pairs: Vec<Ticker> =
@@ -231,6 +246,7 @@ impl App {
             self.auth_token,
             configured_pairs,
             &available_tickers,
+            Arc::clone(&self.diagnostics),
             self.tls_config,
             self.rate_limiter,
             admission_gate,

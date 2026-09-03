@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
-use tokio::sync::{broadcast, mpsc};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use flowsurface_exchange::TickerInfo;
@@ -11,36 +12,45 @@ use flowsurface_exchange::adapter::{
 use flowsurface_exchange::{PushFrequency, TickMultiplier, Timeframe};
 use futures::{StreamExt, stream::BoxStream, stream::select_all};
 
+use crate::diagnostics::Diagnostics;
+
 /// How many events are buffered for best-effort consumers before
 /// the slowest lagged receiver starts dropping messages.
 const BROADCAST_CAPACITY: usize = 1024;
 
 /// Capacity of the channel from exchange stream tasks to the event
-/// router.  When full, events are dropped and a warning is logged
-/// once — the server self-heals when backpressure subsides.
-const EVENT_CHANNEL_CAPACITY: usize = 1_000_000;
+/// router. When full, events are dropped and a warning is logged once.
+const EVENT_CHANNEL_CAPACITY: usize = 4_096;
 
 /// Capacity of the channel from the event router to the batch
-/// flusher.  Together with `DataBuffer` this provides two layers
-/// of backpressure before data loss.
-const PERSIST_CHANNEL_CAPACITY: usize = 500_000;
+/// flusher. Together with `DataBuffer` this bounds in-memory data
+/// before an overload drop is recorded.
+const PERSIST_CHANNEL_CAPACITY: usize = 4_096;
 
 /// Aggregates all outbound channels for market-data events.
 ///
-/// Both channels carry raw [`Event`]s — no variant-specific typing
-/// until the final consumer.
+/// Both channels carry raw [`Event`]s. They are intentionally bounded so
+/// overload produces observable loss instead of unbounded memory growth.
 #[derive(Clone)]
 struct EventOutlets {
+    diagnostics: Arc<Diagnostics>,
     /// Persist channel (bounded; drops when full to prevent OOM).
-    /// Single consumer — the persister in `storage.rs`.
+    /// Single consumer, the persister in `storage.rs`.
     persist: Option<mpsc::Sender<Event>>,
     /// Best-effort fan-out to WebSocket API, alerters, etc.
     broadcast: Option<broadcast::Sender<Event>>,
 }
 
+enum StreamExit {
+    Shutdown,
+    SourceEnded(String),
+    OutputClosed,
+}
+
 impl EventOutlets {
-    fn new() -> Self {
+    fn new(diagnostics: Arc<Diagnostics>) -> Self {
         Self {
+            diagnostics,
             persist: None,
             broadcast: None,
         }
@@ -71,6 +81,7 @@ impl EventOutlets {
                 maybe = event_rx.recv() => {
                     match maybe {
                         Some(event) => {
+                            self.diagnostics.record_stream_event(&event);
                             match &event {
                                 Event::Connected(streams) => {
                                     if let Some(exchange) = stream_exchange(streams) {
@@ -99,16 +110,18 @@ impl EventOutlets {
                                 match tx.try_send(event) {
                                     Ok(()) => {
                                         if persist_full_warned {
+                                            self.diagnostics.record_persist_channel_recovered();
                                             tracing::info!(
-                                                "Persist channel recovered — no longer dropping events"
+                                                "Persist channel recovered, no longer dropping events"
                                             );
                                             persist_full_warned = false;
                                         }
                                     }
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    Err(mpsc::error::TrySendError::Full(event)) => {
+                                        self.diagnostics.record_persist_channel_drop(&event);
                                         if !persist_full_warned {
                                             tracing::warn!(
-                                                "Persist channel full ({} events) — \
+                                                "Persist channel full ({} events), \
                                                  dropping events until backpressure subsides",
                                                 PERSIST_CHANNEL_CAPACITY,
                                             );
@@ -143,7 +156,7 @@ fn stream_exchange(streams: &[StreamKind]) -> Option<Exchange> {
 pub struct StreamManager {
     /// All outbound channels.  The event handler gets its own clone.
     outlets: EventOutlets,
-    /// Per-exchange stream engine tasks.
+    /// Per-exchange stream supervisors.
     stream_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Event handler task.
     event_task: Option<tokio::task::JoinHandle<()>>,
@@ -155,7 +168,7 @@ pub struct StreamManager {
 /// variants.
 #[derive(Default)]
 pub struct StreamReceivers {
-    /// Persist channel — carries every [`Event`] as-is.
+    /// Persist channel carries every [`Event`] as-is.
     pub persist: Option<mpsc::Receiver<Event>>,
 }
 
@@ -168,6 +181,7 @@ impl StreamManager {
         handles: AdapterHandles,
         pairs: &[TickerInfo],
         shutdown: CancellationToken,
+        diagnostics: Arc<Diagnostics>,
     ) -> (Self, StreamReceivers) {
         let (persist_tx, persist_rx) = mpsc::channel(PERSIST_CHANNEL_CAPACITY);
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(BROADCAST_CAPACITY);
@@ -177,7 +191,7 @@ impl StreamManager {
             all_streams.push(StreamKind::Trades { ticker_info: *ti });
         }
 
-        // Low-level per-exchange WebSocket tasks.
+        // Supervised per-exchange stream workers.
         let (event_rx, stream_tasks) = {
             let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
@@ -192,15 +206,16 @@ impl StreamManager {
                 let tx = event_tx.clone();
                 let shutdown = shutdown.child_token();
                 let handles = handles.clone();
+                let diagnostics = Arc::clone(&diagnostics);
 
-                tasks.push(tokio::spawn(async move {
-                    if let Err(e) =
-                        run_exchange_streams(handles, exchange, exchange_streams, tx, shutdown)
-                            .await
-                    {
-                        tracing::error!("Stream engine for {exchange} exited: {e:#}");
-                    }
-                }));
+                tasks.push(tokio::spawn(supervise_exchange_streams(
+                    handles,
+                    exchange,
+                    exchange_streams,
+                    tx,
+                    shutdown,
+                    diagnostics,
+                )));
             }
 
             // Drop the original sender so all clones live inside the tasks.
@@ -210,7 +225,7 @@ impl StreamManager {
             (event_rx, tasks)
         };
 
-        let outlets = EventOutlets::new()
+        let outlets = EventOutlets::new(diagnostics)
             .with_persist(persist_tx)
             .with_broadcast(broadcast_tx);
 
@@ -262,9 +277,11 @@ async fn run_exchange_streams(
     handles: AdapterHandles,
     exchange: Exchange,
     streams: Vec<StreamKind>,
-    tx: mpsc::Sender<Event>,
+    tx: &mpsc::Sender<Event>,
     shutdown: CancellationToken,
-) -> anyhow::Result<()> {
+    diagnostics: Arc<Diagnostics>,
+    connected: watch::Sender<bool>,
+) -> StreamExit {
     // Separate streams by kind so we can build the right StreamConfig.
     let mut trade_tickers: Vec<TickerInfo> = Vec::new();
     let mut depth_specs: Vec<(TickerInfo, StreamTicksize, PushFrequency)> = Vec::new();
@@ -325,31 +342,47 @@ async fn run_exchange_streams(
     let mut merged = select_all(box_streams);
     let mut channel_full_warned = false;
 
+    let exit;
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 tracing::info!(%exchange, "Stream engine cancelled, shutting down");
+                exit = StreamExit::Shutdown;
+                break;
+            }
+            _ = tx.closed() => {
+                tracing::info!(%exchange, "Event channel closed, stopping stream engine");
+                exit = StreamExit::OutputClosed;
                 break;
             }
             event = merged.next() => {
                 match event {
                     Some(event) => {
+                        let is_connected = matches!(&event, Event::Connected(_));
+                        if is_connected {
+                            connected.send_replace(true);
+                        }
                         match tx.try_send(event) {
                             Ok(()) => {
                                 if channel_full_warned {
+                                    diagnostics.record_event_channel_recovered(exchange);
                                     tracing::info!(
                                         %exchange,
-                                        "Event channel recovered — no longer dropping events"
+                                        "Event channel recovered, no longer dropping events"
                                     );
                                     channel_full_warned = false;
                                 }
                             }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
+                            Err(mpsc::error::TrySendError::Full(event)) => {
+                                diagnostics.record_event_channel_drop(exchange, &event);
+                                if matches!(&event, Event::Connected(_) | Event::Disconnected(..)) {
+                                    diagnostics.record_stream_event(&event);
+                                }
                                 if !channel_full_warned {
                                     tracing::warn!(
                                         %exchange,
-                                        "Event channel full ({} events) — \
+                                        "Event channel full ({} events), \
                                          dropping events for {exchange}",
                                         EVENT_CHANNEL_CAPACITY,
                                     );
@@ -358,12 +391,14 @@ async fn run_exchange_streams(
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 tracing::info!(%exchange, "Event channel closed, stopping stream engine");
+                                exit = StreamExit::OutputClosed;
                                 break;
                             }
                         }
                     }
                     None => {
                         tracing::info!(%exchange, "All streams ended");
+                        exit = StreamExit::SourceEnded("all exchange streams ended".to_owned());
                         break;
                     }
                 }
@@ -371,5 +406,110 @@ async fn run_exchange_streams(
         }
     }
 
-    Ok(())
+    exit
+}
+
+async fn supervise_exchange_streams(
+    handles: AdapterHandles,
+    exchange: Exchange,
+    streams: Vec<StreamKind>,
+    tx: mpsc::Sender<Event>,
+    shutdown: CancellationToken,
+    diagnostics: Arc<Diagnostics>,
+) {
+    let (connected_tx, mut connected_rx) = watch::channel(false);
+    let mut restart_delay = std::time::Duration::from_secs(1);
+
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        connected_tx.send_replace(false);
+        let worker_shutdown = shutdown.child_token();
+        let worker_handles = handles.clone();
+        let worker_streams = streams.clone();
+        let worker_tx = tx.clone();
+        let worker_diagnostics = Arc::clone(&diagnostics);
+        let worker_connected = connected_tx.clone();
+        let mut worker = tokio::spawn(async move {
+            run_exchange_streams(
+                worker_handles,
+                exchange,
+                worker_streams,
+                &worker_tx,
+                worker_shutdown,
+                worker_diagnostics,
+                worker_connected,
+            )
+            .await
+        });
+
+        let worker_result = loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    worker.abort();
+                    let _ = worker.await;
+                    return;
+                }
+                changed = connected_rx.changed() => {
+                    if changed.is_ok() && *connected_rx.borrow() {
+                        restart_delay = std::time::Duration::from_secs(1);
+                    }
+                }
+                result = &mut worker => {
+                    break result;
+                }
+            }
+        };
+
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        if *connected_rx.borrow() {
+            restart_delay = std::time::Duration::from_secs(1);
+        }
+
+        let (reason, should_restart) = match worker_result {
+            Ok(StreamExit::Shutdown) => return,
+            Ok(StreamExit::OutputClosed) => ("Event router closed".to_string(), false),
+            Ok(StreamExit::SourceEnded(reason)) => (reason, true),
+            Err(error) => {
+                let reason = if error.is_panic() {
+                    format!("stream worker panicked: {error}")
+                } else {
+                    format!("stream worker cancelled: {error}")
+                };
+                (reason, true)
+            }
+        };
+
+        if !should_restart {
+            diagnostics.record_stream_task_stopped(exchange, &reason);
+            tracing::error!(
+                target: "flowsurface_server::feeds",
+                %exchange,
+                %reason,
+                "Stream task stopped"
+            );
+            return;
+        }
+
+        diagnostics.record_stream_task_restarting(exchange, &reason);
+        tracing::error!(
+            target: "flowsurface_server::feeds",
+            %exchange,
+            %reason,
+            delay_ms = restart_delay.as_millis() as u64,
+            "Stream task ended, restarting"
+        );
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(restart_delay) => {}
+        }
+        restart_delay = (restart_delay * 2).min(std::time::Duration::from_secs(30));
+    }
 }

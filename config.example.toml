@@ -72,7 +72,7 @@ data_retention_hours = 168
 # Default: 2000 (2 seconds).
 # flush_interval_ms = 2000
 
-# Maximum trades to buffer in memory before dropping (OOM guard).
+# Maximum trades to buffer in memory before dropping newer trades (OOM guard).
 # 200k trades ≈ 20-40 MB — safe for hosts with 1 GB+ RAM.
 # Default: 200000.
 # max_buffered_trades = 200000
