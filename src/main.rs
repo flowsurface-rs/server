@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod discovery;
 mod limiter;
+mod logging;
 mod storage;
 mod stream;
 mod tls;
@@ -15,7 +16,6 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 use flowsurface_exchange::adapter::AdapterHandles;
 use flowsurface_exchange::{Ticker, TickerInfo};
@@ -34,13 +34,6 @@ async fn main() {
 
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,flowsurface_exchange=warn")),
-        )
-        .init();
-
     let args = Args::parse();
     let config_path = Config::resolve_path(args.config);
     let mut config = Config::load_or_write_template(&config_path);
@@ -53,6 +46,9 @@ async fn main() {
     } else {
         PathBuf::from(&config.storage.data_dir)
     };
+
+    logging::init(&data_dir);
+    tracing::info!(data_dir = %data_dir.display(), "Starting flowsurface-server");
 
     if let Err(e) = config.resolve_auth_token(&data_dir) {
         tracing::error!("{e:#}");
@@ -253,6 +249,10 @@ impl App {
             self.query_budget,
         ));
         let (server_task, server_shutdown_handle) = server.serve(self.bind_address).await;
+        let access_reporter = logging::spawn_access_summary_reporter(
+            Arc::clone(&self.diagnostics),
+            shutdown.child_token(),
+        );
 
         AppHandles {
             shutdown,
@@ -260,6 +260,7 @@ impl App {
             flusher,
             _cleanup,
             _server: server_task,
+            _access_reporter: access_reporter,
             server_shutdown_handle,
         }
     }
@@ -272,6 +273,7 @@ struct AppHandles {
     flusher: tokio::task::JoinHandle<()>,
     _cleanup: tokio::task::JoinHandle<()>,
     _server: tokio::task::JoinHandle<()>,
+    _access_reporter: tokio::task::JoinHandle<()>,
     server_shutdown_handle: axum_server::Handle<std::net::SocketAddr>,
 }
 
@@ -304,6 +306,9 @@ impl AppHandles {
         tokio::time::timeout(Self::SHUTDOWN_GRACE_PERIOD, async {
             // Flusher first - it drains the trade buffer to disk.
             let _ = self.flusher.await;
+
+            // Emit the final access summary before the logging task exits.
+            let _ = self._access_reporter.await;
 
             // Streaming tasks (engine + handler).
             if let Some(mgr) = self.stream_mgr.take() {

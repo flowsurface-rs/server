@@ -669,6 +669,7 @@ impl Storage {
                         }
                         None => {
                             tracing::warn!(
+                                target: "flowsurface_server::feeds",
                                 "Flush handle was unexpectedly None after is_finished check"
                             );
                         }
@@ -732,7 +733,10 @@ impl Storage {
                                     &diagnostics,
                                 )
                                 .await;
-                                tracing::info!("Batch flusher channel closed.");
+                                tracing::info!(
+                                    target: "flowsurface_server::feeds",
+                                    "Batch flusher channel closed."
+                                );
                                 break;
                             }
                         }
@@ -787,6 +791,7 @@ async fn complete_flush(
             let pending = failure.batch.len();
             diagnostics.record_flush_failed(&format!("{:#}", failure.error), pending);
             tracing::error!(
+                target: "flowsurface_server::feeds",
                 "Batch flush failed ({pending} trades retained for retry): {:#}",
                 failure.error
             );
@@ -801,6 +806,7 @@ async fn complete_flush(
             diagnostics.record_flush_failed(reason, 0);
             diagnostics.record_flush_dropped(in_flight_trades);
             tracing::error!(
+                target: "flowsurface_server::feeds",
                 dropped_trades = in_flight_trades,
                 "{reason}"
             );
@@ -833,6 +839,7 @@ async fn flush_final_batch(
             diagnostics.record_flush_failed(&format!("{:#}", failure.error), trade_count);
             diagnostics.record_flush_dropped(failure.batch.len());
             tracing::error!(
+                target: "flowsurface_server::feeds",
                 dropped_trades = failure.batch.len(),
                 "Final batch flush failed: {:#}",
                 failure.error
@@ -847,6 +854,7 @@ async fn flush_final_batch(
             diagnostics.record_flush_failed(reason, trade_count);
             diagnostics.record_flush_dropped(trade_count);
             tracing::error!(
+                target: "flowsurface_server::feeds",
                 dropped_trades = trade_count,
                 "{reason}"
             );
@@ -913,12 +921,14 @@ impl BatchFlusher {
             }
             Event::DepthReceived(stream_kind, _update_t, _depth) => {
                 tracing::trace!(
+                    target: "flowsurface_server::feeds",
                     ?stream_kind,
                     "Depth update received"
                 );
             }
             Event::KlineReceived(stream_kind, _kline) => {
                 tracing::trace!(
+                    target: "flowsurface_server::feeds",
                     ?stream_kind,
                     "Kline update received"
                 );
@@ -969,6 +979,7 @@ impl DataBuffer {
             true
         } else if !self.warned {
             tracing::warn!(
+                target: "flowsurface_server::feeds",
                 "Data buffer exceeded {}, dropping items to protect against OOM. \
                  This warning is rate-limited.",
                 self.max
@@ -983,6 +994,7 @@ impl DataBuffer {
     fn flush_succeeded(&mut self) {
         if self.warned {
             tracing::info!(
+                target: "flowsurface_server::feeds",
                 "Data buffer flushed; back within capacity (max {}).",
                 self.max
             );

@@ -25,10 +25,11 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     config::BearerToken,
-    diagnostics::{Diagnostics, DiagnosticsSnapshot},
+    diagnostics::{AccessEvent, AccessLogDecision, Diagnostics, DiagnosticsSnapshot},
     limiter::{
         AdmissionGate, ConnectionLimiter, LimiterAcceptor, MAX_CONCURRENT_CONNECTIONS, RateLimiter,
     },
+    logging::ACCESS_TARGET,
     storage::{PairInfo, QueryCancellation, Storage},
 };
 
@@ -450,10 +451,16 @@ impl Server {
 
         if !expected_token.is_valid_authorization(provided) {
             let token_len = provided.len();
-            tracing::warn!(
-                "Auth failure from {}: expected valid Bearer token (received header of {token_len} bytes)",
-                peer_addr.ip(),
-            );
+            if matches!(
+                self.diagnostics.record_access(AccessEvent::AuthFailure),
+                AccessLogDecision::Emit
+            ) {
+                tracing::warn!(
+                    target: ACCESS_TARGET,
+                    "Auth failure from {}: expected valid Bearer token (received header of {token_len} bytes)",
+                    peer_addr.ip(),
+                );
+            }
             return Err((StatusCode::UNAUTHORIZED, "missing or invalid auth token"));
         }
 
@@ -801,6 +808,7 @@ impl Server {
     ) -> (tokio::task::JoinHandle<()>, Handle<std::net::SocketAddr>) {
         let tls_config = self.tls_config.clone();
         let limiter = self.connection_limiter.clone();
+        let diagnostics = Arc::clone(&self.diagnostics);
 
         // Public route — /status is rate-gated but NOT auth-gated.
         let public = Router::new()
@@ -865,6 +873,7 @@ impl Server {
                     .map(|acceptor| LimiterAcceptor {
                         inner: acceptor,
                         limiter: limiter.clone(),
+                        diagnostics: Arc::clone(&diagnostics),
                     });
 
                 server
@@ -891,6 +900,7 @@ impl Server {
                     .map(|acceptor| LimiterAcceptor {
                         inner: acceptor,
                         limiter: limiter.clone(),
+                        diagnostics: Arc::clone(&diagnostics),
                     });
 
                 server
@@ -934,11 +944,17 @@ async fn rate_limit_middleware(
     if let Some(ref limiter) = state.rate_limiter
         && !limiter.check(peer_addr.ip()).await
     {
-        tracing::warn!(
-            "Rate limit exceeded for {} on {}",
-            peer_addr.ip(),
-            req.uri().path(),
-        );
+        if matches!(
+            state.diagnostics.record_access(AccessEvent::RateLimited),
+            AccessLogDecision::Emit
+        ) {
+            tracing::warn!(
+                target: ACCESS_TARGET,
+                "Rate limit exceeded for {} on {}",
+                peer_addr.ip(),
+                req.uri().path(),
+            );
+        }
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(header::CONTENT_TYPE, "application/json")],
@@ -985,11 +1001,19 @@ async fn priority_gate_middleware(
     }
 
     if !state.admission_gate.admit(peer_addr.ip()).await {
-        tracing::warn!(
-            "Admission gate blocked {} on {} (global budget exhausted)",
-            peer_addr.ip(),
-            req.uri().path(),
-        );
+        if matches!(
+            state
+                .diagnostics
+                .record_access(AccessEvent::AdmissionBlocked),
+            AccessLogDecision::Emit
+        ) {
+            tracing::warn!(
+                target: ACCESS_TARGET,
+                "Admission gate blocked {} on {} (global budget exhausted)",
+                peer_addr.ip(),
+                req.uri().path(),
+            );
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::CONTENT_TYPE, "application/json")],

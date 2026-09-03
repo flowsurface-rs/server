@@ -194,6 +194,20 @@ treated as one:
 It prioritizes **convenience** over guaranteed delivery, as it's simply
 made as a companion for [flowsurface](https://github.com/flowsurface-rs/flowsurface).
 
+### Logs
+
+Logs are written to `data_dir/logs` in three daily rotating categories:
+
+- `server`: startup, configuration, API, database, and lifecycle events.
+- `feeds`: exchange connection and ingestion events.
+- `access`: authentication, admission, rate-limit, and connection events.
+
+Access details are sampled and summarized periodically. Dates use UTC. If a
+category's file is unavailable or encounters an I/O error, that category
+falls back to stderr while the other categories continue normally. Suspended
+file output is retried at most once per minute after the current segment can
+be reopened and retention pruning succeeds.
+
 ## API endpoints
 
 `/status` is **public** (no auth).
@@ -215,10 +229,10 @@ Returns the server health status. No authentication required.
 
 #### Response fields
 
-| Field         | Type   | Description                   |
-| ------------- | ------ | ----------------------------- |
-| `status`      | string | Always `"ok"` while running   |
-| `uptime_secs` | int    | Seconds since server start    |
+| Field         | Type   | Description                                                             |
+| ------------- | ------ | ----------------------------------------------------------------------- |
+| `status`      | string | Always `"ok"` while running                                             |
+| `uptime_secs` | int    | Seconds since server start                                              |
 | `db_ok`       | bool   | `true` if DuckDB is reachable |
 
 #### Example

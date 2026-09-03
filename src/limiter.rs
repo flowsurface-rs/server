@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tower_service::Service;
 
+use crate::{
+    diagnostics::{AccessEvent, AccessLogDecision, Diagnostics},
+    logging::ACCESS_TARGET,
+};
+
 /// Per-IP token-bucket rate limiter.
 ///
 /// Each IP gets a token bucket that refills at a constant rate.
@@ -402,6 +407,7 @@ where
 pub struct LimiterAcceptor<A> {
     pub inner: A,
     pub limiter: ConnectionLimiter,
+    pub diagnostics: Arc<Diagnostics>,
 }
 
 impl<I, S, A> axum_server::accept::Accept<I, S> for LimiterAcceptor<A>
@@ -421,10 +427,17 @@ where
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let Some(permit) = self.limiter.try_acquire() else {
-            tracing::warn!(
-                "Connection rejected: at capacity ({} max)",
-                MAX_CONCURRENT_CONNECTIONS,
-            );
+            if matches!(
+                self.diagnostics
+                    .record_access(AccessEvent::ConnectionRejected),
+                AccessLogDecision::Emit
+            ) {
+                tracing::warn!(
+                    target: ACCESS_TARGET,
+                    "Connection rejected: at capacity ({} max)",
+                    MAX_CONCURRENT_CONNECTIONS,
+                );
+            }
             return Box::pin(async move {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
@@ -434,6 +447,7 @@ where
         };
 
         let inner_fut = self.inner.accept(stream, service);
+        let diagnostics = Arc::clone(&self.diagnostics);
         Box::pin(async move {
             match tokio::time::timeout(ACCEPT_TIMEOUT, inner_fut).await {
                 Ok(Ok((stream, service))) => Ok((
@@ -445,7 +459,15 @@ where
                 )),
                 Ok(Err(e)) => Err(e),
                 Err(_elapsed) => {
-                    tracing::warn!("Connection accept timed out after {ACCEPT_TIMEOUT:?}",);
+                    if matches!(
+                        diagnostics.record_access(AccessEvent::AcceptTimeout),
+                        AccessLogDecision::Emit
+                    ) {
+                        tracing::warn!(
+                            target: ACCESS_TARGET,
+                            "Connection accept timed out after {ACCEPT_TIMEOUT:?}",
+                        );
+                    }
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "handshake timed out",
