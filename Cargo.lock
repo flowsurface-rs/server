@@ -990,8 +990,7 @@ dependencies = [
 [[package]]
 name = "flowsurface-exchange"
 version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9561e624ed7e991bf3c64765407d14bcecf95ebf171b5e7abbb45c69c800456"
+source = "git+https://github.com/flowsurface-rs/flowsurface.git?rev=1e30016ed34dbe5bb333ab869d6454f926af6e83#1e30016ed34dbe5bb333ab869d6454f926af6e83"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1004,6 +1003,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
+ "rand 0.10.2",
  "reqwest",
  "rustc-hash",
  "serde",
@@ -1036,6 +1036,7 @@ dependencies = [
  "hyper-util",
  "parking_lot",
  "rcgen",
+ "reqwest",
  "rustc-hash",
  "rustls 0.23.42",
  "serde",

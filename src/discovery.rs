@@ -26,7 +26,8 @@ pub async fn setup_pairs(
             .collect()
     };
     tracing::info!("Spawning venue adapters: {venues:?}");
-    let adapter_handles = AdapterHandles::spawn_venues(venues, None);
+    let client = reqwest::Client::new();
+    let adapter_handles = AdapterHandles::spawn_venues(&client, venues, None);
 
     tracing::info!("Fetching ticker metadata from exchanges…");
     let metadata_cache = build_metadata_cache(&adapter_handles, whitelist, discovery_mode).await;

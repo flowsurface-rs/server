@@ -72,8 +72,20 @@ impl EventOutlets {
                     match maybe {
                         Some(event) => {
                             match &event {
-                                Event::Connected(exchange) => tracing::info!(%exchange, "Stream connected"),
-                                Event::Disconnected(exchange, reason) => tracing::warn!(%exchange, %reason, "Stream disconnected"),
+                                Event::Connected(streams) => {
+                                    if let Some(exchange) = stream_exchange(streams) {
+                                        tracing::info!(%exchange, "Stream connected");
+                                    } else {
+                                        tracing::info!("Stream connected");
+                                    }
+                                }
+                                Event::Disconnected(streams, reason) => {
+                                    if let Some(exchange) = stream_exchange(streams) {
+                                        tracing::warn!(%exchange, %reason, "Stream disconnected");
+                                    } else {
+                                        tracing::warn!(%reason, "Stream disconnected");
+                                    }
+                                }
                                 _ => {}
                             }
 
@@ -119,6 +131,12 @@ impl EventOutlets {
             }
         }
     }
+}
+
+fn stream_exchange(streams: &[StreamKind]) -> Option<Exchange> {
+    streams
+        .first()
+        .map(|stream| stream.ticker_info().exchange())
 }
 
 #[allow(dead_code)]
