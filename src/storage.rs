@@ -78,6 +78,14 @@ impl QueryCancellation {
     }
 }
 
+struct QueryCancellationGuard(Arc<QueryCancellation>);
+
+impl Drop for QueryCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ArrowExportStats {
     pub rows: usize,
@@ -313,8 +321,12 @@ impl Storage {
             .context("cloning root connection for query")
     }
 
-    pub fn query_trades(&self, q: &TradeQuery) -> Result<Vec<AnnotatedTrade>> {
-        let conn = self.connection()?;
+    pub(crate) fn query_trades(
+        &self,
+        q: &TradeQuery,
+        cancellation: &QueryCancellation,
+    ) -> Result<Vec<AnnotatedTrade>> {
+        let conn = self.connection_with_cancellation(cancellation)?;
 
         let limit = q.limit.unwrap_or(1000).min(10_000);
         let exchange = q.exchange_filter();
@@ -380,10 +392,7 @@ impl Storage {
         output: &mut impl std::io::Write,
         cancellation: &QueryCancellation,
     ) -> Result<ArrowExportStats> {
-        let conn = self.connection()?;
-        if !cancellation.attach(conn.interrupt_handle()) {
-            anyhow::bail!("Arrow export cancelled before execution");
-        }
+        let conn = self.connection_with_cancellation(cancellation)?;
 
         let limit = q.limit.unwrap_or(DEFAULT_ARROW_LIMIT).min(MAX_ARROW_LIMIT);
         let exchange = q.exchange_filter();
@@ -487,8 +496,11 @@ impl Storage {
 
     /// Return every (venue, symbol) that has at least one stored trade,
     /// along with the earliest and latest timestamps.
-    pub fn pairs_with_bounds(&self) -> Result<Vec<PairInfo>> {
-        let conn = self.connection()?;
+    pub(crate) fn pairs_with_bounds(
+        &self,
+        cancellation: &QueryCancellation,
+    ) -> Result<Vec<PairInfo>> {
+        let conn = self.connection_with_cancellation(cancellation)?;
 
         let mut stmt = conn.prepare(
             "SELECT exchange, symbol,
@@ -555,7 +567,18 @@ impl Storage {
         }
     }
 
-    /// Run a blocking DuckDB query on the blocking thread pool with a timeout.
+    fn connection_with_cancellation(
+        &self,
+        cancellation: &QueryCancellation,
+    ) -> Result<duckdb::Connection> {
+        let conn = self.connection()?;
+        if !cancellation.attach(conn.interrupt_handle()) {
+            anyhow::bail!("query cancelled before execution");
+        }
+        Ok(conn)
+    }
+
+    /// Run a cancellable blocking DuckDB query on the blocking thread pool.
     ///
     /// # Errors
     ///
@@ -563,13 +586,22 @@ impl Storage {
     /// - Query failure (the closure returned `Err`)
     /// - Task panic (`spawn_blocking` panicked)
     /// - Timeout (the deadline elapsed)
-    pub async fn run_blocking_query<T: Send + 'static>(
+    pub(crate) async fn run_blocking_query<T: Send + 'static>(
         self,
         deadline: Duration,
         label: &str,
-        f: impl FnOnce(Storage) -> anyhow::Result<T> + Send + 'static,
+        f: impl FnOnce(Storage, &QueryCancellation) -> anyhow::Result<T> + Send + 'static,
     ) -> Result<T, (StatusCode, &'static str)> {
-        match tokio::time::timeout(deadline, tokio::task::spawn_blocking(move || f(self))).await {
+        let cancellation = Arc::new(QueryCancellation::new());
+        let worker_cancellation = Arc::clone(&cancellation);
+        let _cancellation_guard = QueryCancellationGuard(Arc::clone(&cancellation));
+        let task = tokio::task::spawn_blocking(move || {
+            let result = f(self, worker_cancellation.as_ref());
+            worker_cancellation.complete();
+            result
+        });
+
+        match tokio::time::timeout(deadline, task).await {
             Ok(Ok(Ok(data))) => Ok(data),
             Ok(Ok(Err(e))) => {
                 tracing::error!("{label} query failed: {e:#}");
@@ -580,6 +612,7 @@ impl Storage {
                 Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
             }
             Err(_) => {
+                cancellation.cancel();
                 tracing::warn!("{label} query timed out after {deadline:?}");
                 Err((StatusCode::SERVICE_UNAVAILABLE, "query timed out"))
             }

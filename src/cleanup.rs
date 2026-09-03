@@ -20,10 +20,10 @@ const SIZE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// Safety ceiling for the size-based purge loop (200 × 100k = 20M rows).
 const MAX_PURGE_ITERATIONS: usize = 200;
 
-/// Conservative estimate of on-disk bytes per trade row.  Used only as
-/// a fast-path threshold; the authoritative check is the real file
-/// size after `CHECKPOINT`.
-const EST_BYTES_PER_ROW: u64 = 50;
+/// Fallback bytes-per-row estimate when there are no rows to calibrate
+/// against, and the ceiling for calibration so a transiently inflated
+/// size cannot drive over-purging.
+const MAX_BYTES_PER_ROW: u64 = 50;
 
 /// On small-to-medium caps use a 20 % headroom so the purge leaves
 /// breathing room.  On very large caps the percentage would waste
@@ -45,12 +45,21 @@ fn purge_headroom(cap: StorageBytes) -> StorageBytes {
     }
 }
 
-/// Batch size for each purge iteration — ~10% of the cap, clamped to
-/// [1 000, 100 000].
-fn purge_batch_size(max_bytes: u64) -> i64 {
+/// Calibrate the bytes-per-row estimate from the observed size and row
+/// count, falling back to the ceiling when there are no rows.
+fn estimate_bytes_per_row(current: StorageBytes, row_count: u64) -> u64 {
+    if row_count == 0 {
+        return MAX_BYTES_PER_ROW;
+    }
+    (current.as_bytes() / row_count).clamp(1, MAX_BYTES_PER_ROW)
+}
+
+/// Batch size for each purge iteration: roughly 10% of the target row
+/// count, clamped to [1_000, 100_000].
+fn purge_batch_size(target_bytes: u64, bytes_per_row: u64) -> i64 {
     const MIN_ROWS: i64 = 1_000;
     const MAX_ROWS: i64 = 100_000;
-    let rows = (max_bytes / 10 / EST_BYTES_PER_ROW) as i64;
+    let rows = (target_bytes / 10 / bytes_per_row) as i64;
     rows.clamp(MIN_ROWS, MAX_ROWS)
 }
 
@@ -205,8 +214,15 @@ impl CleanupScheduler {
             .saturating_sub(headroom.as_bytes())
             .max(MIN_TARGET.as_bytes());
         let target_bytes = StorageBytes::from_bytes(target_bytes);
-        let max_est_rows = target_bytes.as_bytes().saturating_div(EST_BYTES_PER_ROW);
-        let batch_size = purge_batch_size(target_bytes.as_bytes());
+
+        let current = self.storage.current_storage_bytes()?;
+        if current <= target_bytes {
+            return Ok(0);
+        }
+
+        let bytes_per_row = estimate_bytes_per_row(current, self.storage.count_trades()?);
+        let max_est_rows = target_bytes.as_bytes().saturating_div(bytes_per_row);
+        let batch_size = purge_batch_size(target_bytes.as_bytes(), bytes_per_row);
         let mut total_deleted = 0u64;
         let mut converged = false;
 

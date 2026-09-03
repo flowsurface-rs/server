@@ -42,6 +42,8 @@ static RATE_LIMITED: &str = r#"{"error":"rate limit exceeded, slow down"}"#;
 /// Static body for 503 responses when the query concurrency cap is hit.
 static QUERY_BUSY: &str = r#"{"error":"server busy, too many concurrent requests"}"#;
 
+const JSON_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Response {
@@ -382,9 +384,10 @@ pub struct Server {
     /// Connection‑level cap that prevents TCP/TLS connection‑storm.
     pub connection_limiter: ConnectionLimiter,
     /// Semaphore capping concurrent in-flight DB-backed response queries
-    /// (`/trades`, `/trades.arrow`). JSON output is materialised in the Rust
-    /// heap, while Arrow output uses a bounded stream outside DuckDB's
-    /// `memory_limit`. The permit remains held for the complete query.
+    /// (`/pairs`, `/trades`, `/trades.arrow`). JSON output is materialised in
+    /// the Rust heap, while Arrow output uses a bounded stream outside
+    /// DuckDB's `memory_limit`. The permit remains held for the complete
+    /// query.
     pub query_semaphore: Arc<Semaphore>,
     /// Memory-derived limits for database-backed HTTP queries.
     pub query_budget: QueryBudget,
@@ -498,8 +501,6 @@ impl Server {
 
     /// Acquire a permit for a DB-backed query handler, or `None` when the
     /// concurrency cap is saturated. Non-blocking: refuse rather than queue.
-    /// Callers move the permit into the blocking task so timeouts do not
-    /// release capacity while the query is still running.
     fn try_acquire_query(state: &Arc<Self>) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&state.query_semaphore).try_acquire_owned().ok()
     }
@@ -512,6 +513,29 @@ impl Server {
             QUERY_BUSY,
         )
             .into_response()
+    }
+
+    async fn run_db_query<T, F>(
+        state: &Arc<Self>,
+        label: &'static str,
+        operation: F,
+    ) -> Result<T, axum::response::Response>
+    where
+        T: Send + 'static,
+        F: FnOnce(Storage, &QueryCancellation) -> anyhow::Result<T> + Send + 'static,
+    {
+        let Some(permit) = Self::try_acquire_query(state) else {
+            return Err(Self::query_busy());
+        };
+
+        let storage = state.storage.clone();
+        storage
+            .run_blocking_query(JSON_QUERY_TIMEOUT, label, move |storage, cancellation| {
+                let _permit = permit;
+                operation(storage, cancellation)
+            })
+            .await
+            .map_err(|(status, message)| Self::json_err(status, message))
     }
 
     async fn database_is_healthy(&self) -> bool {
@@ -642,14 +666,13 @@ impl Server {
     /// Pairs that have been configured but have not yet received any trades
     /// appear with `earliest: null` / `latest: null`.
     async fn pairs(State(state): State<Arc<Self>>) -> impl IntoResponse {
-        let storage = state.storage.clone();
-
-        let db_pairs = match storage
-            .run_blocking_query(Duration::from_secs(10), "pairs", |s| s.pairs_with_bounds())
-            .await
+        let db_pairs = match Self::run_db_query(&state, "pairs", |storage, cancellation| {
+            storage.pairs_with_bounds(cancellation)
+        })
+        .await
         {
             Ok(pairs) => pairs,
-            Err((status, msg)) => return Self::json_err(status, msg),
+            Err(response) => return response,
         };
 
         // Build a lookup keyed by "exchange:symbol" from DB results.
@@ -692,22 +715,14 @@ impl Server {
             return Self::json_err(StatusCode::BAD_REQUEST, &msg);
         }
 
-        let storage = state.storage.clone();
-
-        let Some(permit) = Self::try_acquire_query(&state) else {
-            return Self::query_busy();
-        };
-
         let q = query.0;
-        match storage
-            .run_blocking_query(Duration::from_secs(10), "trades", move |s| {
-                let _permit = permit;
-                s.query_trades(&q)
-            })
-            .await
+        match Self::run_db_query(&state, "trades", move |storage, cancellation| {
+            storage.query_trades(&q, cancellation)
+        })
+        .await
         {
             Ok(trades) => Self::json_ok(&Response::Trades { trades }),
-            Err((status, msg)) => Self::json_err(status, msg),
+            Err(response) => response,
         }
     }
 

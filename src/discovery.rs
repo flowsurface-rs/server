@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
+use futures::StreamExt;
+
 use flowsurface_exchange::adapter::{AdapterHandles, Exchange, MarketKind, Venue};
 use flowsurface_exchange::{Ticker, TickerInfo};
 
@@ -14,6 +16,10 @@ pub type MetadataCache = FxHashMap<Exchange, FxHashMap<Ticker, Option<TickerInfo
 const EXCHANGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const EXCHANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Bound on concurrent metadata fetches during startup discovery, so a
+/// growing exchange list cannot fire an unbounded request burst.
+const METADATA_FETCH_CONCURRENCY: usize = 8;
 
 /// Orchestrate the full pair discovery pipeline: determine which venues to
 /// use based on discovery mode, spawn adapter handles, fetch ticker metadata
@@ -78,6 +84,46 @@ where
         .context("metadata operation failed")
 }
 
+async fn fetch_exchange_metadata(
+    handles: &AdapterHandles,
+    exchange: Exchange,
+) -> (Exchange, Result<HashMap<Ticker, Option<TickerInfo>>>) {
+    let venue = exchange.venue();
+    let market = exchange.market_type();
+    let result = fetch_ticker_metadata(handles, venue, &[market]).await;
+    (exchange, result)
+}
+
+fn exchanges_to_fetch(templates: &WhitelistTemplates, discovery_mode: bool) -> Vec<Exchange> {
+    if discovery_mode {
+        return Exchange::ALL.to_vec();
+    }
+
+    let mut exchanges = Vec::new();
+    let mut seen = FxHashSet::default();
+
+    for (venue_str, markets) in templates {
+        let Ok(venue) = venue_str.parse::<Venue>() else {
+            tracing::warn!("Unknown venue in whitelist: {venue_str}, skipping");
+            continue;
+        };
+
+        for &market_kind in markets.keys() {
+            let market: MarketKind = market_kind.into();
+            let Some(exchange) = Exchange::from_venue_and_market(venue, market) else {
+                tracing::warn!("Unsupported venue+market combination: {venue_str} {market_kind}");
+                continue;
+            };
+
+            if seen.insert(exchange) {
+                exchanges.push(exchange);
+            }
+        }
+    }
+
+    exchanges
+}
+
 /// Fetch metadata for exchanges and return a cache.
 ///
 /// When `discovery_mode` is `true`, this ignores the whitelist templates
@@ -90,47 +136,24 @@ async fn build_metadata_cache(
 ) -> MetadataCache {
     let mut cache = MetadataCache::default();
 
-    if discovery_mode {
-        for exchange in Exchange::ALL {
-            let venue = exchange.venue();
-            let market = exchange.market_type();
+    let exchanges = exchanges_to_fetch(templates, discovery_mode);
+    let results: Vec<_> = futures::stream::iter(
+        exchanges
+            .into_iter()
+            .map(|exchange| fetch_exchange_metadata(handles, exchange)),
+    )
+    .buffer_unordered(METADATA_FETCH_CONCURRENCY)
+    .collect()
+    .await;
 
-            match fetch_ticker_metadata(handles, venue, &[market]).await {
-                Ok(meta) => {
-                    tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
-                    cache.insert(exchange, meta.into_iter().collect());
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch metadata for {exchange}: {e:#}");
-                }
+    for (exchange, result) in results {
+        match result {
+            Ok(meta) => {
+                tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
+                cache.insert(exchange, meta.into_iter().collect());
             }
-        }
-    } else {
-        for (venue_str, markets) in templates {
-            let Ok(venue) = venue_str.parse::<Venue>() else {
-                tracing::warn!("Unknown venue in whitelist: {venue_str}, skipping");
-                continue;
-            };
-
-            for &market_kind in markets.keys() {
-                let market: MarketKind = market_kind.into();
-
-                let Some(exchange) = Exchange::from_venue_and_market(venue, market) else {
-                    tracing::warn!(
-                        "Unsupported venue+market combination: {venue_str} {market_kind}"
-                    );
-                    continue;
-                };
-
-                match fetch_ticker_metadata(handles, venue, &[market]).await {
-                    Ok(meta) => {
-                        tracing::info!("Fetched metadata for {exchange}: {} tickers", meta.len());
-                        cache.insert(exchange, meta.into_iter().collect());
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch metadata for {exchange}: {e:#}");
-                    }
-                }
+            Err(e) => {
+                tracing::warn!("Failed to fetch metadata for {exchange}: {e:#}");
             }
         }
     }

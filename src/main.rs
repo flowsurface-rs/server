@@ -201,13 +201,6 @@ impl App {
     async fn serve(self) -> AppHandles {
         let shutdown = CancellationToken::new();
 
-        let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
-            self.adapter_handles,
-            &self.resolved_pairs,
-            shutdown.child_token(),
-            Arc::clone(&self.diagnostics),
-        );
-
         let cleanup_last_run = tokio::task::spawn_blocking({
             let scheduler = self.cleanup_scheduler.clone();
             move || scheduler.run_pass()
@@ -215,9 +208,12 @@ impl App {
         .await
         .unwrap_or(None);
 
-        let _cleanup = self
-            .cleanup_scheduler
-            .spawn(cleanup_last_run, shutdown.child_token());
+        let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
+            self.adapter_handles,
+            &self.resolved_pairs,
+            shutdown.child_token(),
+            Arc::clone(&self.diagnostics),
+        );
 
         let flusher = self.storage.spawn_batch_flusher(
             &mut rx,
@@ -225,6 +221,10 @@ impl App {
             self.max_buffered_trades,
             Arc::clone(&self.diagnostics),
         );
+
+        let _cleanup = self
+            .cleanup_scheduler
+            .spawn(cleanup_last_run, shutdown.child_token());
 
         let configured_pairs: Vec<Ticker> =
             self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
