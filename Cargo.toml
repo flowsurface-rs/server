@@ -24,7 +24,7 @@ sha2 = "0.11"
 base64 = "0.23"
 
 # Exchange WebSocket adapters
-flowsurface-exchange = { git = "https://github.com/flowsurface-rs/flowsurface.git", rev = "1e30016ed34dbe5bb333ab869d6454f926af6e83", package = "flowsurface-exchange" }
+flowsurface-exchange = { git = "https://github.com/flowsurface-rs/flowsurface.git", rev = "c1388d4f6765b56ce02783981311cf46435e5c48", package = "flowsurface-exchange" }
 
 # Storage
 duckdb = { version = "1.10505", features = ["bundled"] }

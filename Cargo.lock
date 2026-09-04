@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "flowsurface-exchange"
 version = "0.8.9"
-source = "git+https://github.com/flowsurface-rs/flowsurface.git?rev=1e30016ed34dbe5bb333ab869d6454f926af6e83#1e30016ed34dbe5bb333ab869d6454f926af6e83"
+source = "git+https://github.com/flowsurface-rs/flowsurface.git?rev=c1388d4f6765b56ce02783981311cf46435e5c48#c1388d4f6765b56ce02783981311cf46435e5c48"
 dependencies = [
  "base64 0.22.1",
  "bytes",
