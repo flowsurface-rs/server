@@ -17,12 +17,12 @@ use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
-use flowsurface_exchange::adapter::AdapterHandles;
-use flowsurface_exchange::{Ticker, TickerInfo};
+use flowsurface_exchange::Ticker;
 
 use crate::api::{QueryBudget, Server, query_budget};
 use crate::config::{Args, BearerToken, Config};
 use crate::diagnostics::Diagnostics;
+use crate::discovery::{Discovery, DiscoveryMode};
 use crate::limiter::{ADMISSION_GLOBAL_CAP, ADMISSION_PER_IP_BUDGET, AdmissionGate, RateLimiter};
 use crate::storage::Storage;
 
@@ -62,10 +62,8 @@ async fn main() {
 
 struct App {
     storage: Storage,
-    adapter_handles: AdapterHandles,
-    resolved_pairs: Vec<TickerInfo>,
+    discovery: Discovery,
     diagnostics: Arc<Diagnostics>,
-    metadata_cache: discovery::MetadataCache,
     bind_address: SocketAddr,
     auth_token: Option<BearerToken>,
     flush_interval: std::time::Duration,
@@ -106,26 +104,28 @@ impl App {
             });
 
         let whitelist = config.resolve_whitelist();
-        if !config.pairs.discovery_mode
+        let discovery_mode = if config.pairs.discovery_mode {
+            DiscoveryMode::AllExchanges
+        } else {
+            DiscoveryMode::WhitelistOnly
+        };
+
+        if matches!(discovery_mode, DiscoveryMode::WhitelistOnly)
             && (whitelist.is_empty() || config.pairs.base_assets.is_empty())
         {
             tracing::error!("No pairs configured. Set base_assets and whitelist in config.toml");
             std::process::exit(1);
         }
 
-        let (adapter_handles, metadata_cache, resolved_pairs) = discovery::setup_pairs(
-            &config.pairs.base_assets,
-            config.pairs.discovery_mode,
-            &whitelist,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to initialise exchange discovery: {e:#}");
-            std::process::exit(1);
-        });
+        let discovery = Discovery::run(&config.pairs.base_assets, discovery_mode, &whitelist)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to initialise exchange discovery: {e:#}");
+                std::process::exit(1);
+            });
 
-        if resolved_pairs.is_empty() {
-            if config.pairs.discovery_mode {
+        if discovery.resolved_pairs().is_empty() {
+            if matches!(discovery_mode, DiscoveryMode::AllExchanges) {
                 tracing::warn!(
                     "No matching pairs for base_assets {:?} with current whitelist \
                      - discovery mode is on, so /exchanges is still populated.",
@@ -142,8 +142,9 @@ impl App {
 
         tracing::info!(
             "Tracking {} pair(s) across {} exchange(s)",
-            resolved_pairs.len(),
-            resolved_pairs
+            discovery.resolved_pairs().len(),
+            discovery
+                .resolved_pairs()
                 .iter()
                 .map(|ti| ti.exchange())
                 .collect::<rustc_hash::FxHashSet<_>>()
@@ -151,12 +152,12 @@ impl App {
         );
 
         let diagnostics = Arc::new(Diagnostics::new());
-        for ticker_info in &resolved_pairs {
+        for ticker_info in discovery.resolved_pairs() {
             diagnostics.register_exchange(ticker_info.exchange());
         }
 
         // Persist ticker metadata for the API layer.
-        if let Err(e) = storage.store_ticker_infos(&resolved_pairs) {
+        if let Err(e) = storage.store_ticker_infos(discovery.resolved_pairs()) {
             tracing::warn!("Failed to persist ticker metadata: {e:#}");
         }
 
@@ -182,10 +183,8 @@ impl App {
 
         Self {
             storage,
-            adapter_handles,
-            resolved_pairs,
+            discovery,
             diagnostics,
-            metadata_cache,
             bind_address: config.network.bind_address,
             auth_token: config.auth_token.clone(),
             flush_interval: std::time::Duration::from_millis(config.storage.flush_interval_ms),
@@ -208,9 +207,12 @@ impl App {
         .await
         .unwrap_or(None);
 
+        let available_tickers = self.discovery.available_tickers();
+        let (adapter_handles, resolved_pairs) = self.discovery.into_streaming_parts();
+
         let (stream_mgr, mut rx) = stream::StreamManager::start_streams(
-            self.adapter_handles,
-            &self.resolved_pairs,
+            adapter_handles,
+            &resolved_pairs,
             shutdown.child_token(),
             Arc::clone(&self.diagnostics),
         );
@@ -226,10 +228,8 @@ impl App {
             .cleanup_scheduler
             .spawn(cleanup_last_run, shutdown.child_token());
 
-        let configured_pairs: Vec<Ticker> =
-            self.resolved_pairs.iter().map(|ti| ti.ticker).collect();
+        let configured_pairs: Vec<Ticker> = resolved_pairs.iter().map(|ti| ti.ticker).collect();
 
-        let available_tickers = discovery::tickers_per_exchange(&self.metadata_cache);
         let admission_gate = AdmissionGate::new(ADMISSION_PER_IP_BUDGET, ADMISSION_GLOBAL_CAP);
         if self.auth_token.is_some() {
             tracing::info!(

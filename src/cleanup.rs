@@ -30,8 +30,8 @@ const MAX_BYTES_PER_ROW: u64 = 50;
 /// too much space, so we cap the absolute headroom at 10 GiB
 const MAX_HEADROOM: StorageBytes = StorageBytes::from_bytes(10 * 1024 * 1024 * 1024);
 
-/// Smallest sane target after headroom subtraction — prevents
-/// pathological behaviour on tiny caps.
+/// Smallest target used for normal-sized caps. The final target is always
+/// clamped to the configured cap so positive caps below this floor remain enforced.
 const MIN_TARGET: StorageBytes = StorageBytes::from_bytes(100 * 1024 * 1024);
 
 /// Compute the headroom to leave free below the cap.
@@ -43,6 +43,14 @@ fn purge_headroom(cap: StorageBytes) -> StorageBytes {
     } else {
         StorageBytes::from_bytes(pct)
     }
+}
+
+fn purge_target_bytes(cap: StorageBytes) -> StorageBytes {
+    let target = cap
+        .as_bytes()
+        .saturating_sub(purge_headroom(cap).as_bytes())
+        .max(MIN_TARGET.as_bytes());
+    StorageBytes::from_bytes(target.min(cap.as_bytes()))
 }
 
 /// Calibrate the bytes-per-row estimate from the observed size and row
@@ -205,15 +213,11 @@ impl CleanupScheduler {
     /// 2. **CHECKPOINT once**, then verify the real file size.  If still over
     ///    the absolute cap we log a warning — the next periodic pass will retry.
     ///
-    /// Targets `cap - headroom` so there is breathing room for incoming
-    /// trades between 5-minute checks without wasting space on large caps.
+    /// Targets `cap - headroom` for normal-sized caps so there is breathing
+    /// room for incoming trades between 5-minute checks. For tiny caps, the
+    /// target is clamped to the configured cap so the hard limit is honored.
     fn purge_oldest_trades_until_below(&self, max_bytes: StorageBytes) -> Result<u64> {
-        let headroom = purge_headroom(max_bytes);
-        let target_bytes = max_bytes
-            .as_bytes()
-            .saturating_sub(headroom.as_bytes())
-            .max(MIN_TARGET.as_bytes());
-        let target_bytes = StorageBytes::from_bytes(target_bytes);
+        let target_bytes = purge_target_bytes(max_bytes);
 
         let current = self.storage.current_storage_bytes()?;
         if current <= target_bytes {

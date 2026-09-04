@@ -981,11 +981,9 @@ impl BatchFlusher {
     }
 
     fn flush_succeeded(&mut self) {
-        if self.has_pending() {
-            return;
+        if self.buf.flush_succeeded() {
+            self.diagnostics.record_buffer_recovered();
         }
-        self.diagnostics.record_buffer_recovered();
-        self.buf.flush_succeeded();
     }
 }
 
@@ -1024,15 +1022,22 @@ impl DataBuffer {
         }
     }
 
-    fn flush_succeeded(&mut self) {
-        if self.warned {
-            tracing::info!(
-                target: "flowsurface_server::feeds",
-                "Data buffer flushed; back within capacity (max {}).",
-                self.max
-            );
-            self.warned = false;
+    fn flush_succeeded(&mut self) -> bool {
+        if !self.warned || !self.has_capacity() {
+            return false;
         }
+
+        tracing::info!(
+            target: "flowsurface_server::feeds",
+            "Data buffer flushed; back within capacity (max {}).",
+            self.max
+        );
+        self.warned = false;
+        true
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.items.len() < self.max
     }
 
     fn is_empty(&self) -> bool {
