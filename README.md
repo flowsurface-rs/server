@@ -12,7 +12,7 @@ It's a self-contained, portable server, designed to run on a small VPS for indiv
 
 ### Prebuilt binaries
 
-1. **Get the latest [release](https://github.com/akenshaw/fs-server/releases/latest)**
+1. **Get the latest [release](https://github.com/flowsurface-rs/server/releases/latest)**
    (`linux-x86_64` or `linux-aarch64`).
 
 2. **Copy the config template**:
@@ -45,14 +45,12 @@ cp config.example.toml config.toml
 cargo run --release
 ```
 
-By default the server looks for `config.toml` in the project root when the
-executable path contains `/target/`; otherwise it looks next
-to the executable (deployed binary). Use `--config /path/to/config.toml` to
-override.
+By default, development builds look for `config.toml` in the project root;
+deployed binaries look beside the executable. Use
+`--config /path/to/config.toml` to override.
 
-> If `config.toml` doesn't exist, the server writes the default
-> template to that path and **exits** (code 2). Edit the created file to suit
-> your needs, then re-run.
+> If the file is missing, the server writes the default template and **exits**
+> with code 2. Edit it, then re-run.
 
 ## Configuration
 
@@ -75,17 +73,14 @@ available options with inline documentation.
 | `data_retention_hours` | `168`    | Purge trades older than this; `0` = keep all. |
 | `memory_limit_mb`      | `0`      | DuckDB RAM cap; `0` = DuckDB default (80%).   |
 
-> **Low-memory hosts:** By default DuckDB is allowed to use 80% of your
-> machine's RAM. On a small host, this can leave too little for
-> the rest of the system, and queries can fail with an
-> `Out of Memory Error`. For such cases, you better explicitly set `memory_limit_mb`
-> to a lower value, such as `256` or `384` for 1 GB host, so that
-> DuckDB can spill to disk instead of failing when it's at the cap. The same
-> setting also derives the maximum Arrow export size and concurrent query
-> limit. Arrow responses are streamed with bounded buffering, so `400` allows
-> up to 1,000,000 Arrow rows while retaining only a small number of response
-> chunks in memory, with one concurrent trade query. An unset value keeps the
-> one-million-row and four-query limits.
+> **Low-memory hosts:** DuckDB defaults to 80% of system RAM, which can starve
+> small hosts and cause `Out of Memory Error`. Set `memory_limit_mb` lower (for
+> example, `256`–`400` on a 1 GB host) to leave headroom and let DuckDB spill to
+> disk. For explicit values, the maximum Arrow export scales at 2,500 rows/MB
+> (clamped to 50,000–1,000,000), while query concurrency is one per 512 MB
+> (clamped to 1–4). Arrow output uses bounded streaming: `400` allows up to
+> 1,000,000 rows with one concurrent query, `1024` allows two, and `2048` allows
+> four. `0` keeps the defaults: 1,000,000 rows and four queries.
 
 ### `[pairs]`
 
@@ -96,37 +91,32 @@ available options with inline documentation.
 
 ### Whitelist templates
 
-The whitelist defines which pairs to track per venue and market kind.
-See the `[whitelist.*]` sections in [`config.example.toml`](config.example.toml)
-for the template. The server combines `base_assets × quote_assets`
-per market kind and resolves the correct exchange-specific ticker strings
-(handling separators, `_PERP`, `-SWAP` suffixes, etc.).
+The whitelist defines which pairs to track per venue and market kind. See the
+`[whitelist.*]` sections in [`config.example.toml`](config.example.toml) for
+the template. The server combines `base_assets × quote_assets` per market kind
+and resolves exchange-specific ticker formats (separators, `_PERP`, `-SWAP`,
+etc.).
 
-> **Wildcard:** An empty string `""` as a quote asset includes **every**
-> ticker on that exchange whose base matches (e.g.
-> `linear = [""]` would track all linear perpetuals with a matching base
-> asset regardless of quote currency).
+> **Wildcard:** An empty quote `""` matches every ticker with the configured
+> base, regardless of quote currency.
 
-Pairs are only tracked when **both** `base_assets` and a matching whitelist
-entry are configured. If either is empty, no pairs are tracked.
-Use the `/exchanges` endpoint to browse available symbols before
-deciding which pairs to track.
+A pair is tracked only when both `base_assets` and a matching whitelist entry
+are configured. Use `/exchanges` to browse available symbols first.
 
 ### Authentication
 
-When binding to a **non-loopback** address, the server:
+When binding to a **non-loopback** address, the first boot generates a random
+256-bit token and stores it as `.auth_token` in `data_dir` (see
+[`[storage]`](#storage)). Its first 4 characters are logged at startup; read
+the full token at any time:
 
-1. Generates a random 256-bit auth token on first boot and persists
-   it as `.auth_token` inside the configured `data_dir` (see [`[storage]`](#storage)).
-2. The token's first 4 characters are printed at startup.
-3. Retrieve the full token at any time:
-    ```bash
-    # data_dir = "data"
-    cat data/.auth_token
-    ```
+```bash
+# data_dir = "data"
+cat data/.auth_token
+```
 
-The token is reused across restarts. To set a specific token set the `AUTH_TOKEN` environment variable
-(via `.env` or the environment).
+The token persists across restarts. Set `AUTH_TOKEN` (via `.env` or the
+environment) to choose a specific token.
 
 ## Remote deployment (VPS)
 
@@ -166,34 +156,6 @@ For local-only use, keep `bind_address = "127.0.0.1:8080"`:
 - No auth token required
 - `curl http://127.0.0.1:8080/pairs` works directly
 
-## Design limitations
-
-This server is not a tick-by-tick market data recorder and shouldn't be
-treated as one:
-
-- **No delivery guarantees**: WebSocket disconnections may cause gaps.
-  Exchange-side replays may introduce duplicates. The server uses
-  [flowsurface-exchange](https://github.com/flowsurface-rs/flowsurface/tree/main/exchange)
-  for market feeds, which is built for charting rather than archival.
-
-- **In-memory buffering**: trades are held in memory for up to
-  `flush_interval_ms` (default 2s) before batch-writing to DuckDB.
-  The adapter's parsed-event output and server ingestion channels are
-  bounded. Under extreme load, full server-owned channels and buffers shed
-  new entries to prevent OOM crashes. Those server-side drops are counted in
-  `/diagnostics` and mark the server degraded while the affected boundary
-  remains saturated. The adapter's bounded parsed output may also shed events
-  before they reach the server. Raw-frame buffering is internal to the
-  adapter.
-
-- **Configuration changes require a restart**: editing tracked pairs
-  or anything in `config.toml` needs a server restart. In-memory
-  buffered trades are flushed to disk during shutdown, but there
-  will be a data gap until the server restarts and feeds reconnect.
-
-It prioritizes **convenience** over guaranteed delivery, as it's simply
-made as a companion for [flowsurface](https://github.com/flowsurface-rs/flowsurface).
-
 ### Logs
 
 Logs are written to `data_dir/logs` in three daily rotating categories:
@@ -207,6 +169,30 @@ category's file is unavailable or encounters an I/O error, that category
 falls back to stderr while the other categories continue normally. Suspended
 file output is retried at most once per minute after the current segment can
 be reopened and retention pruning succeeds.
+
+## Design limitations
+
+This server is not a tick-by-tick market data recorder and shouldn't be
+treated as one:
+
+- **No delivery guarantees**: WebSocket disconnections may cause gaps.
+  Exchange-side replays may introduce duplicates. The server uses
+  [flowsurface-exchange](https://github.com/flowsurface-rs/flowsurface/tree/main/exchange)
+  for market feeds, which is built for charting rather than archival.
+
+- **In-memory buffering**: trades wait up to `flush_interval_ms` (default 2s)
+  before batch-writing to DuckDB. Adapter output and server channels are
+  bounded; saturated server buffers drop new entries to prevent OOM and report
+  those drops in `/diagnostics`, marking the server degraded while saturated.
+  The adapter may also drop parsed events; raw-frame buffering is internal.
+
+- **Configuration changes require a restart**: editing tracked pairs
+  or anything in `config.toml` needs a server restart. In-memory
+  buffered trades are flushed to disk during shutdown, but there
+  will be a data gap until the server restarts and feeds reconnect.
+
+It prioritizes **convenience** over guaranteed delivery, as it's simply
+made as a companion for [flowsurface](https://github.com/flowsurface-rs/flowsurface).
 
 ## API endpoints
 
@@ -229,10 +215,10 @@ Returns the server health status. No authentication required.
 
 #### Response fields
 
-| Field         | Type   | Description                                                             |
-| ------------- | ------ | ----------------------------------------------------------------------- |
-| `status`      | string | Always `"ok"` while running                                             |
-| `uptime_secs` | int    | Seconds since server start                                              |
+| Field         | Type   | Description                   |
+| ------------- | ------ | ----------------------------- |
+| `status`      | string | Always `"ok"` while running   |
+| `uptime_secs` | int    | Seconds since server start    |
 | `db_ok`       | bool   | `true` if DuckDB is reachable |
 
 #### Example
@@ -275,7 +261,7 @@ curl -H "Authorization: Bearer <token>" \
 {
     "status": "healthy",
     "uptime_secs": 123,
-    "database": {"ok": true},
+    "database": { "ok": true },
     "feeds": [
         {
             "exchange": "Binance Linear",
